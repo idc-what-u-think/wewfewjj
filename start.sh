@@ -63,7 +63,7 @@ while true; do
   # Check cloudflared is still running
   if ! kill -0 $CF_PID 2>/dev/null; then
     echo "[firekid] Cloudflare tunnel died, restarting..."
-    cloudflared tunnel --no-autoupdate run --token "${CF_TUNNEL_TOKEN}" &
+    cloudflared tunnel --no-autoupdate --protocol http2 run --token "${CF_TUNNEL_TOKEN}" &
     CF_PID=$!
   fi
 done
