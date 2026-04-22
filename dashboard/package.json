@@ -1,0 +1,27 @@
+{
+  "name": "firekid-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "express-session": "^1.17.3",
+    "ws": "^8.16.0",
+    "node-pty": "^1.0.0",
+    "http-proxy-middleware": "^3.0.0",
+    "multer": "^1.4.5-lts.1",
+    "pm2": "^5.3.1",
+    "axios": "^1.6.0",
+    "cookie-parser": "^1.4.6",
+    "dotenv": "^16.4.1",
+    "uuid": "^9.0.0",
+    "systeminformation": "^5.21.22",
+    "chokidar": "^3.5.3",
+    "archiver": "^6.0.1",
+    "simple-git": "^3.22.0",
+    "bcryptjs": "^2.4.3"
+  }
+}
