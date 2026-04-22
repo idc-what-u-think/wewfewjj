@@ -55,7 +55,6 @@ echo "[firekid] Starting dashboard on port ${DASHBOARD_PORT:-3000}..."
 pm2 start /dashboard/index.js \
   --name dashboard \
   --max-restarts 10 \
-  --min-uptime 3000 \
   --out /var/log/firekid/dashboard.out.log \
   --error /var/log/firekid/dashboard.err.log \
   2>&1
