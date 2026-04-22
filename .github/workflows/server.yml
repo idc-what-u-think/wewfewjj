@@ -64,15 +64,26 @@ jobs:
       # ── 5. Wait for container to be healthy ──
       - name: Wait for dashboard
         run: |
-          echo "Waiting for dashboard to be ready..."
-          for i in $(seq 1 60); do
-            if curl -sf http://localhost:3000/auth/me > /dev/null 2>&1; then
-              echo "Dashboard is ready after ${i}s"
-              break
+          echo "Waiting for dashboard to be stable..."
+          STABLE=0
+          for i in $(seq 1 90); do
+            RESP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/auth/me 2>/dev/null || echo "000")
+            if [ "$RESP" = "200" ]; then
+              STABLE=$((STABLE + 1))
+              echo "  Attempt $i: HTTP $RESP (stable: $STABLE/3)"
+              if [ $STABLE -ge 3 ]; then
+                echo "Dashboard is stable after ${i}s"
+                break
+              fi
+            else
+              STABLE=0
+              if [ $((i % 5)) -eq 0 ]; then
+                echo "  Attempt $i: HTTP $RESP (waiting...)"
+              fi
             fi
-            if [ $i -eq 60 ]; then
-              echo "Dashboard failed to start. Logs:"
-              docker logs firekid --tail 50
+            if [ $i -eq 90 ]; then
+              echo "Dashboard failed to stabilize. Logs:"
+              docker logs firekid --tail 60
               exit 1
             fi
             sleep 2
@@ -108,9 +119,22 @@ jobs:
         run: |
           echo "Container status:"
           docker ps --filter name=firekid --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-          echo ""
-          echo "Dashboard test:"
-          curl -s http://localhost:3000/auth/me
+
+          echo "Waiting for dashboard to respond..."
+          for i in $(seq 1 30); do
+            RESP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/auth/me 2>/dev/null || echo "000")
+            echo "  Attempt $i: HTTP $RESP"
+            if [ "$RESP" = "200" ]; then
+              echo "Dashboard is up"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "Dashboard still not responding. Container logs:"
+              docker logs firekid --tail 40
+            fi
+            sleep 3
+          done
+
           echo ""
           echo "Public URL: https://server.firekidofficial.name.ng"
 
