@@ -52,7 +52,6 @@ jobs:
             -v firekid-logs:/var/log/firekid \
             -e DASHBOARD_USERNAME="${{ secrets.DASHBOARD_USERNAME }}" \
             -e DASHBOARD_PASSWORD="${{ secrets.DASHBOARD_PASSWORD }}" \
-            -e CF_TUNNEL_TOKEN="${{ secrets.CF_TUNNEL_TOKEN }}" \
             -e WORKER_URL="${{ secrets.WORKER_URL }}" \
             -e WORKER_SECRET="${{ secrets.WORKER_SECRET }}" \
             -e SESSION_SECRET="${{ secrets.SESSION_SECRET }}" \
@@ -79,14 +78,41 @@ jobs:
             sleep 2
           done
 
-      # ── 6. Show status ──
+      # ── 6. Start Cloudflare tunnel on the RUNNER (not inside Docker) ──
+      - name: Start Cloudflare tunnel
+        run: |
+          # Install cloudflared on the runner
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb
+          rm cloudflared-linux-amd64.deb
+
+          # Start tunnel pointing to the container's exposed port
+          cloudflared tunnel --no-autoupdate --protocol http2 run \
+            --token "${{ secrets.CF_TUNNEL_TOKEN }}" \
+            2>&1 &
+          CF_PID=$!
+
+          echo "CF_PID=$CF_PID" >> $GITHUB_ENV
+
+          # Wait for tunnel to connect
+          sleep 8
+          if kill -0 $CF_PID 2>/dev/null; then
+            echo "Cloudflare tunnel started successfully (PID: $CF_PID)"
+          else
+            echo "Cloudflare tunnel failed to start"
+            exit 1
+          fi
+
+      # ── 7. Show status ──
       - name: Server status
         run: |
           echo "Container status:"
           docker ps --filter name=firekid --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
           echo ""
-          echo "Dashboard logs (last 20 lines):"
-          docker logs firekid --tail 20
+          echo "Dashboard test:"
+          curl -s http://localhost:3000/auth/me
+          echo ""
+          echo "Public URL: https://server.firekidofficial.name.ng"
 
       # ── 7. Keep job alive + self-restart at 5h45m ──
       - name: Keep alive
