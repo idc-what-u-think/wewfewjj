@@ -47,7 +47,15 @@ RUN mkdir -p /services /var/log/firekid /dashboard
 
 # ── Install dashboard deps ──
 COPY dashboard/package.json /dashboard/
-RUN cd /dashboard && npm install
+RUN cd /dashboard && npm install 2>&1
+
+# ── Rebuild native modules for this exact Node/OS version ──
+RUN cd /dashboard && npm rebuild node-pty 2>&1 && echo "node-pty rebuilt OK"
+
+# ── Verify critical deps load correctly at build time ──
+RUN node -e "require('/dashboard/node_modules/node-pty'); console.log('node-pty OK')"
+RUN node -e "require('/dashboard/node_modules/express'); console.log('express OK')"
+RUN node -e "require('/dashboard/node_modules/ws'); console.log('ws OK')"
 
 # ── Copy dashboard source ──
 COPY dashboard/ /dashboard/
