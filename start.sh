@@ -50,15 +50,33 @@ else
   echo "[firekid] WARNING: Dashboard exited during dry-run"
 fi
 
-# ── Start dashboard via pm2 ──
+# ── Start dashboard via pm2 ecosystem file ──
 echo "[firekid] Starting dashboard on port ${DASHBOARD_PORT:-3000}..."
-pm2 start /dashboard/index.js \
-  --name dashboard \
-  --max-restarts 10 \
-  --out /var/log/firekid/dashboard.out.log \
-  --error /var/log/firekid/dashboard.err.log \
-  2>&1
 
+cat > /tmp/ecosystem.config.js << EOF
+module.exports = {
+  apps: [{
+    name: 'dashboard',
+    script: '/dashboard/index.js',
+    max_restarts: 10,
+    out_file: '/var/log/firekid/dashboard.out.log',
+    error_file: '/var/log/firekid/dashboard.err.log',
+    merge_logs: true,
+    env: {
+      DASHBOARD_PORT: process.env.DASHBOARD_PORT || '3000',
+      DASHBOARD_USERNAME: process.env.DASHBOARD_USERNAME,
+      DASHBOARD_PASSWORD: process.env.DASHBOARD_PASSWORD,
+      WORKER_URL: process.env.WORKER_URL,
+      WORKER_SECRET: process.env.WORKER_SECRET,
+      SESSION_SECRET: process.env.SESSION_SECRET,
+      GH_PAT: process.env.GH_PAT,
+      SERVICES_DIR: process.env.SERVICES_DIR || '/services',
+    }
+  }]
+}
+EOF
+
+pm2 start /tmp/ecosystem.config.js 2>&1
 sleep 3
 pm2 list 2>&1
 
