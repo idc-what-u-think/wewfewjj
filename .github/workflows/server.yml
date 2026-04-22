@@ -1,0 +1,127 @@
+name: Firekid Server
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'dashboard/**'
+      - 'Dockerfile'
+      - 'start.sh'
+
+concurrency:
+  group: firekid-server
+  cancel-in-progress: true
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      # ── 1. Free up disk space (runner comes with ~50GB used out of 72GB) ──
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      # ── 2. Checkout ──
+      - uses: actions/checkout@v4
+
+      # ── 3. Build Docker image ──
+      - name: Build image
+        run: |
+          docker build -t firekid-server:latest .
+          echo "Image built successfully"
+          docker images firekid-server
+
+      # ── 4. Start container ──
+      - name: Start server container
+        run: |
+          docker run -d \
+            --name firekid \
+            --restart unless-stopped \
+            -p 3000:3000 \
+            -v firekid-services:/services \
+            -v firekid-logs:/var/log/firekid \
+            -e DASHBOARD_USERNAME="${{ secrets.DASHBOARD_USERNAME }}" \
+            -e DASHBOARD_PASSWORD="${{ secrets.DASHBOARD_PASSWORD }}" \
+            -e CF_TUNNEL_TOKEN="${{ secrets.CF_TUNNEL_TOKEN }}" \
+            -e WORKER_URL="${{ secrets.WORKER_URL }}" \
+            -e WORKER_SECRET="${{ secrets.WORKER_SECRET }}" \
+            -e SESSION_SECRET="${{ secrets.SESSION_SECRET }}" \
+            -e GH_PAT="${{ secrets.GH_PAT }}" \
+            -e DASHBOARD_PORT="3000" \
+            firekid-server:latest
+
+          echo "Container started"
+
+      # ── 5. Wait for container to be healthy ──
+      - name: Wait for dashboard
+        run: |
+          echo "Waiting for dashboard to be ready..."
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:3000/auth/me > /dev/null 2>&1; then
+              echo "Dashboard is ready after ${i}s"
+              break
+            fi
+            if [ $i -eq 60 ]; then
+              echo "Dashboard failed to start. Logs:"
+              docker logs firekid --tail 50
+              exit 1
+            fi
+            sleep 2
+          done
+
+      # ── 6. Show status ──
+      - name: Server status
+        run: |
+          echo "Container status:"
+          docker ps --filter name=firekid --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+          echo ""
+          echo "Dashboard logs (last 20 lines):"
+          docker logs firekid --tail 20
+
+      # ── 7. Keep job alive + self-restart at 5h45m ──
+      - name: Keep alive
+        run: |
+          echo "Server is running. Job will self-restart at 5h45m."
+          echo "Public URL: https://server.firekidofficial.name.ng"
+
+          # Monitor container health every 5 minutes
+          END_TIME=$(($(date +%s) + 5*3600 + 45*60))
+
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+
+            # Check if container is still running
+            if ! docker ps --filter name=firekid --filter status=running -q | grep -q .; then
+              echo "Container stopped unexpectedly. Restarting..."
+              docker start firekid || true
+              sleep 10
+            fi
+
+            REMAINING=$(( $END_TIME - $(date +%s) ))
+            echo "Server running. ${REMAINING}s until next cycle."
+          done
+
+          echo "5h45m elapsed. Triggering next workflow run..."
+
+          # Save container state before restart
+          docker exec firekid pm2 save 2>/dev/null || true
+
+          # Trigger next run
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/server.yml/dispatches \
+            -d '{"ref":"main"}' \
+            && echo "Next run triggered successfully" \
+            || echo "Failed to trigger next run"
