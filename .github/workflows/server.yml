@@ -82,8 +82,22 @@ jobs:
               fi
             fi
             if [ $i -eq 90 ]; then
-              echo "Dashboard failed to stabilize. Logs:"
-              docker logs firekid --tail 60
+              echo "Dashboard failed to stabilize. Dumping all logs:"
+              echo ""
+              echo "=== docker logs ==="
+              docker logs firekid --tail 80
+              echo ""
+              echo "=== pm2 error log ==="
+              docker exec firekid cat /var/log/firekid/dashboard.err.log 2>/dev/null || echo "(empty)"
+              echo ""
+              echo "=== pm2 out log ==="
+              docker exec firekid cat /var/log/firekid/dashboard.out.log 2>/dev/null || echo "(empty)"
+              echo ""
+              echo "=== pm2 list ==="
+              docker exec firekid pm2 list 2>/dev/null || echo "(pm2 not running)"
+              echo ""
+              echo "=== pm2 logs last 50 ==="
+              docker exec firekid pm2 logs dashboard --lines 50 --nostream 2>/dev/null || echo "(no pm2 logs)"
               exit 1
             fi
             sleep 2
