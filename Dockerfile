@@ -34,11 +34,6 @@ RUN curl -fsSL https://deno.land/install.sh | sh \
 # ── pm2 ──
 RUN npm install -g pm2
 
-# ── cloudflared ──
-RUN wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
-    && dpkg -i cloudflared-linux-amd64.deb \
-    && rm cloudflared-linux-amd64.deb
-
 # ── node-pty deps (needs python + make + g++) ──
 RUN npm install -g node-gyp
 
