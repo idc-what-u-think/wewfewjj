@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM node:20-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV SERVICES_DIR=/services
@@ -6,48 +6,31 @@ ENV DASHBOARD_PORT=3000
 
 # ── Base packages ──
 RUN apt-get update && apt-get install -y \
-    curl wget git build-essential \
-    python3 python3-pip python3-venv \
+    curl wget git \
+    python3 python3-pip \
     unzip tar ca-certificates \
     lsof procps net-tools \
-    && rm -rf /var/lib/apt/lists/*
-
-# ── Node.js 20 ──
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Bun ──
 RUN curl -fsSL https://bun.sh/install | bash \
     && ln -s /root/.bun/bin/bun /usr/local/bin/bun
 
-# ── Go ──
-RUN wget -q https://go.dev/dl/go1.22.0.linux-amd64.tar.gz \
-    && tar -C /usr/local -xzf go1.22.0.linux-amd64.tar.gz \
-    && rm go1.22.0.linux-amd64.tar.gz
-ENV PATH=$PATH:/usr/local/go/bin
-
-# ── Deno ──
-RUN curl -fsSL https://deno.land/install.sh | sh \
-    && ln -s /root/.deno/bin/deno /usr/local/bin/deno
-
-# ── pm2 ──
-RUN npm install -g pm2
-
-# ── node-pty deps (needs python + make + g++) ──
-RUN npm install -g node-gyp
+# ── PM2 + node-gyp ──
+RUN npm install -g pm2 node-gyp
 
 # ── Setup directories ──
 RUN mkdir -p /services /var/log/firekid /dashboard
 
 # ── Install dashboard deps ──
 COPY dashboard/package.json /dashboard/
-RUN cd /dashboard && npm install 2>&1
+RUN cd /dashboard && npm install --production=false
 
-# ── Rebuild native modules for this exact Node/OS version ──
-RUN cd /dashboard && npm rebuild node-pty 2>&1 && echo "node-pty rebuilt OK"
+# ── Rebuild native modules ──
+RUN cd /dashboard && npm rebuild node-pty && echo "node-pty OK"
 
-# ── Verify critical deps load correctly at build time ──
+# ── Verify critical deps ──
 RUN node -e "require('/dashboard/node_modules/node-pty'); console.log('node-pty OK')"
 RUN node -e "require('/dashboard/node_modules/express'); console.log('express OK')"
 RUN node -e "require('/dashboard/node_modules/ws'); console.log('ws OK')"
