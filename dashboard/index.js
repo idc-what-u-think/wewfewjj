@@ -259,16 +259,33 @@ async function startServiceProcess(service) {
     });
   }
 
+  // Ensure dirs exist
+  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync('/var/log/firekid', { recursive: true });
+
+  // Parse start_command into script + args so PM2 handles it correctly
+  // e.g. "node index.js" -> script:"node", args:"index.js"
+  // e.g. "npm start"     -> script:"npm",  args:"start"
+  const parts = service.start_command.trim().split(/\s+/);
+  const script = parts[0];
+  const args = parts.slice(1).join(' ');
+
   await pm2Connect();
+
+  // Delete any old crashed instance first to avoid ghost processes eating RAM
+  await pm2Delete(service.id).catch(() => {});
+
   await pm2Start({
     name: service.id,
-    script: service.start_command,
+    script,
+    args: args || undefined,
     cwd: dir,
     env: { ...process.env, ...envVars, PORT: service.port },
     autorestart: service.auto_restart === 1,
-    max_restarts: 10,
-    min_uptime: '5s',
-    exp_backoff_restart_delay: 100,
+    max_restarts: 5,
+    min_uptime: '10s',
+    exp_backoff_restart_delay: 500,
+    kill_timeout: 5000,
     out_file: `/var/log/firekid/${service.id}.out.log`,
     error_file: `/var/log/firekid/${service.id}.err.log`,
     merge_logs: true,
@@ -705,15 +722,20 @@ app.get('/api/services/:id/logs', requireAuth, async (req, res) => {
     const logFile = `/var/log/firekid/${svc.id}.out.log`;
     const errFile = `/var/log/firekid/${svc.id}.err.log`;
 
-    const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+    // Create log files if they don't exist yet so tail -f doesn't silently fail
+    fs.mkdirSync('/var/log/firekid', { recursive: true });
+    if (!fs.existsSync(logFile)) fs.writeFileSync(logFile, '');
+    if (!fs.existsSync(errFile)) fs.writeFileSync(errFile, '');
+
+    const send = (data) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {} };
 
     // Send last 100 lines first
-    if (fs.existsSync(logFile)) {
-      try {
-        const lines = fs.readFileSync(logFile, 'utf-8').split('\n').slice(-100);
-        lines.forEach(line => line && send({ type: 'out', message: line, time: Date.now() }));
-      } catch {}
-    }
+    try {
+      const lines = fs.readFileSync(logFile, 'utf-8').split('\n').slice(-100);
+      lines.forEach(line => line && send({ type: 'out', message: line, time: Date.now() }));
+      const errLines = fs.readFileSync(errFile, 'utf-8').split('\n').slice(-50);
+      errLines.forEach(line => line && send({ type: 'err', message: line, time: Date.now() }));
+    } catch {}
 
     // Tail live
     const tail = spawn('tail', ['-f', '-n', '0', logFile], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -723,8 +745,8 @@ app.get('/api/services/:id/logs', requireAuth, async (req, res) => {
     tailErr.stdout.on('data', d => d.toString().split('\n').filter(Boolean).forEach(line => send({ type: 'err', message: line, time: Date.now() })));
 
     req.on('close', () => {
-      tail.kill();
-      tailErr.kill();
+      try { tail.kill(); } catch {}
+      try { tailErr.kill(); } catch {}
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
