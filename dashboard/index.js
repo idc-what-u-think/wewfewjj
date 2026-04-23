@@ -21,7 +21,8 @@ const simpleGit = require('simple-git');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: '/ws' });
+// noServer = we handle the upgrade manually so session is available in WS
+const wss = new WebSocket.Server({ noServer: true });
 
 const PORT = process.env.DASHBOARD_PORT || 3000;
 const SERVICES_DIR = process.env.SERVICES_DIR || '/services';
@@ -69,12 +70,15 @@ const d1 = {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
-app.use(session({
+
+const sessionMiddleware = session({
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
   cookie: { httpOnly: true, maxAge: 24 * 60 * 60 * 1000 },
-}));
+});
+
+app.use(sessionMiddleware);
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -835,18 +839,43 @@ app.post('/webhook/:serviceId', express.raw({ type: 'application/json' }), async
 // WEBSOCKET — terminal per service
 // ─────────────────────────────────────────────────────
 
+// Handle upgrade manually so session middleware runs before WS auth check
+server.on('upgrade', (req, socket, head) => {
+  if (!req.url.startsWith('/ws')) {
+    socket.destroy();
+    return;
+  }
+  sessionMiddleware(req, {}, () => {
+    if (!req.session?.authenticated) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
+  });
+});
+
 const terminals = new Map();
 
 wss.on('connection', (ws, req) => {
-  if (!req.session?.authenticated) {
-    ws.close(1008, 'Not authenticated');
-    return;
-  }
-
   const urlParts = req.url.split('/');
   const serviceId = urlParts[urlParts.length - 1]?.split('?')[0];
 
   let shell;
+  let alive = true;
+
+  // Ping every 20s to keep connection open through proxies/CF tunnel
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    } else {
+      clearInterval(pingInterval);
+    }
+  }, 20000);
+
+  ws.on('pong', () => { alive = true; });
 
   (async () => {
     const svc = serviceId !== 'global' ? await getService(serviceId).catch(() => null) : null;
@@ -870,6 +899,7 @@ wss.on('connection', (ws, req) => {
     shell.on('exit', (code) => {
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'exit', code }));
       terminals.delete(termId);
+      clearInterval(pingInterval);
     });
 
     ws.on('message', (msg) => {
@@ -881,7 +911,15 @@ wss.on('connection', (ws, req) => {
     });
 
     ws.on('close', () => {
-      shell.kill();
+      clearInterval(pingInterval);
+      if (shell) shell.kill();
+      terminals.delete(termId);
+    });
+
+    ws.on('error', (err) => {
+      console.error('WS error:', err.message);
+      clearInterval(pingInterval);
+      if (shell) shell.kill();
       terminals.delete(termId);
     });
   })();
