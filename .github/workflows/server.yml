@@ -2,14 +2,10 @@ name: Firekid Server
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/server.yml'
 
 concurrency:
   group: firekid-server
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   server:
@@ -17,19 +13,7 @@ jobs:
     timeout-minutes: 355
 
     steps:
-      # ── 1. Free disk space ──
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false
-
-      # ── 2. Pull image from GHCR (no build) ──
+      # ── 1. Pull image from GHCR (no build) ──
       - name: Pull image
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
@@ -37,7 +21,7 @@ jobs:
           echo "Image pulled successfully"
           docker images ghcr.io/${{ github.repository }}
 
-      # ── 3. Start container ──
+      # ── 2. Start container ──
       - name: Start server container
         run: |
           docker run -d \
@@ -58,7 +42,7 @@ jobs:
           echo "Container started"
           docker ps --filter name=firekid
 
-      # ── 4. Wait for dashboard to be healthy ──
+      # ── 3. Wait for dashboard to be healthy ──
       - name: Wait for dashboard
         run: |
           echo "Waiting for dashboard to stabilize..."
@@ -87,7 +71,7 @@ jobs:
             sleep 2
           done
 
-      # ── 5. Start Cloudflare tunnel on runner ──
+      # ── 4. Start Cloudflare tunnel on runner ──
       - name: Start Cloudflare tunnel
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
@@ -108,7 +92,7 @@ jobs:
             exit 1
           fi
 
-      # ── 6. Server status ──
+      # ── 5. Server status ──
       - name: Server status
         run: |
           echo "Container:"
@@ -120,7 +104,7 @@ jobs:
           echo ""
           echo "Public URL: https://server.firekidofficial.name.ng"
 
-      # ── 7. Keep alive + self-restart at 5h20m ──
+      # ── 6. Keep alive + self-restart at 5h20m ──
       - name: Keep alive
         run: |
           echo "Server is running."
