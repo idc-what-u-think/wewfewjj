@@ -8,12 +8,24 @@ on:
 jobs:
   restart:
     runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled'
+    if: |
+      github.event.workflow_run.conclusion == 'failure'
 
     steps:
-      - name: Wait before restart
+      - name: Check runtime before restarting
         run: |
           echo "Server workflow ended with: ${{ github.event.workflow_run.conclusion }}"
+          # Only restart if it ran for more than 3 minutes (avoid restart loops on bad configs)
+          CREATED="${{ github.event.workflow_run.created_at }}"
+          UPDATED="${{ github.event.workflow_run.updated_at }}"
+          START=$(date -d "$CREATED" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$CREATED" +%s)
+          END=$(date -d "$UPDATED" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED" +%s)
+          RUNTIME=$((END - START))
+          echo "Runtime: ${RUNTIME}s"
+          if [ $RUNTIME -lt 180 ]; then
+            echo "Runtime < 3min — likely a bad config or concurrency cancel. Skipping restart."
+            exit 0
+          fi
           echo "Waiting 30s before restarting..."
           sleep 30
 
