@@ -19,38 +19,7 @@ for var in "${required[@]}"; do
   echo "[firekid]   $var = SET"
 done
 
-# ── Check node_modules ──
-echo "[firekid] Checking node_modules..."
-if [ ! -d "/dashboard/node_modules" ]; then
-  echo "[firekid] node_modules missing, running npm install..."
-  cd /dashboard && npm install 2>&1
-fi
-
-# ── Rebuild native modules ──
-echo "[firekid] Rebuilding native modules..."
-cd /dashboard && npm rebuild node-pty 2>&1 && echo "[firekid] node-pty OK"
-
-# ── Test deps ──
-echo "[firekid] Testing dependencies..."
-deps=(express ws express-session cookie-parser multer pm2 axios systeminformation uuid simple-git)
-for dep in "${deps[@]}"; do
-  node -e "require('$dep'); console.log('[firekid]   $dep OK')" 2>&1 || echo "[firekid]   $dep FAILED"
-done
-
-# ── Dry run test ──
-echo "[firekid] Dry-run test..."
-timeout 5 node /dashboard/index.js 2>&1 &
-TESTPID=$!
-sleep 4
-if kill -0 $TESTPID 2>/dev/null; then
-  echo "[firekid] Dry-run passed"
-  kill $TESTPID 2>/dev/null || true
-  wait $TESTPID 2>/dev/null || true
-else
-  echo "[firekid] WARNING: Dashboard exited during dry-run"
-fi
-
-# ── Start dashboard via pm2 ecosystem file ──
+# ── Start dashboard via pm2 ──
 echo "[firekid] Starting dashboard on port ${DASHBOARD_PORT:-3000}..."
 
 cat > /tmp/ecosystem.config.js << EOF
@@ -58,10 +27,13 @@ module.exports = {
   apps: [{
     name: 'dashboard',
     script: '/dashboard/index.js',
-    max_restarts: 10,
+    max_restarts: 20,
+    min_uptime: '5s',
+    exp_backoff_restart_delay: 200,
     out_file: '/var/log/firekid/dashboard.out.log',
     error_file: '/var/log/firekid/dashboard.err.log',
     merge_logs: true,
+    node_args: '--max-old-space-size=512',
     env: {
       DASHBOARD_PORT: process.env.DASHBOARD_PORT || '3000',
       DASHBOARD_USERNAME: process.env.DASHBOARD_USERNAME,
@@ -100,16 +72,16 @@ if [ "$READY" = "0" ]; then
   cat /var/log/firekid/dashboard.out.log 2>/dev/null || echo "(no stdout log)"
 fi
 
-echo "[firekid] Dashboard running. Cloudflare tunnel is managed by the host runner."
+echo "[firekid] Dashboard running. Cloudflare tunnel managed by host runner."
 
-# ── Keep container alive ──
+# ── Keep container alive + auto-heal ──
 while true; do
   sleep 30
   RESP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${DASHBOARD_PORT:-3000}/auth/me 2>/dev/null || echo "000")
   if [ "$RESP" != "200" ]; then
     echo "[firekid] Dashboard unhealthy (HTTP $RESP), restarting..."
-    tail -10 /var/log/firekid/dashboard.err.log 2>/dev/null || true
-    pm2 restart dashboard 2>&1 || pm2 start /dashboard/index.js --name dashboard 2>&1
+    tail -20 /var/log/firekid/dashboard.err.log 2>/dev/null || true
+    pm2 restart dashboard 2>&1 || pm2 start /tmp/ecosystem.config.js 2>&1
     sleep 5
   fi
 done
