@@ -1144,6 +1144,7 @@ function renderFilesPage(serviceId) {
 async function loadFileTree(serviceId, filePath = '/') {
   if (!serviceId) return;
   state.activeServiceId = serviceId;
+  state.currentFilePath = filePath;
   const res = await api('GET', `/api/services/${serviceId}/files?path=${encodeURIComponent(filePath)}`).catch(() => ({ files: [] }));
   const tree = document.getElementById('file-tree-content');
   tree.innerHTML = res.files.map(f => `
@@ -1172,6 +1173,57 @@ async function openFile(serviceId, filePath) {
     }
   } catch (e) {
     notify(`Cannot open file: ${e.message}`, 'error');
+  }
+}
+
+
+async function uploadFile() {
+  const serviceId = state.activeServiceId;
+  if (!serviceId) return notify('Select a service first', 'error');
+
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.multiple = true;
+  input.onchange = async () => {
+    if (!input.files.length) return;
+    const formData = new FormData();
+    const currentPath = state.currentFilePath || '/';
+    formData.append('path', currentPath);
+    for (const file of input.files) formData.append('files', file);
+
+    try {
+      const res = await fetch(`/api/services/${serviceId}/files/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Upload failed');
+      notify(`Uploaded ${data.uploaded} file(s)`, 'success');
+      loadFileTree(serviceId, currentPath);
+    } catch (e) {
+      notify(`Upload failed: ${e.message}`, 'error');
+    }
+  };
+  input.click();
+}
+
+async function newFile() {
+  const serviceId = state.activeServiceId;
+  if (!serviceId) return notify('Select a service first', 'error');
+
+  const name = prompt('File name (e.g. index.js):');
+  if (!name || !name.trim()) return;
+
+  const currentPath = state.currentFilePath || '/';
+  const filePath = currentPath.replace(/\/$/, '') + '/' + name.trim();
+
+  try {
+    await api('POST', `/api/services/${serviceId}/files/save`, { path: filePath, content: '' });
+    notify(`Created ${name}`, 'success');
+    loadFileTree(serviceId, currentPath);
+    openFile(serviceId, filePath);
+  } catch (e) {
+    notify(`Failed to create file: ${e.message}`, 'error');
   }
 }
 
