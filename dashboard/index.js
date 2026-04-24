@@ -546,11 +546,21 @@ app.post('/api/services/:id/deploy', requireAuth, async (req, res) => {
     const svc = await getService(req.params.id);
     if (!svc) return end(false, 'Service not found');
 
-    send('download', `Downloading ${svc.repo_url}...`);
+    const dir = getServiceDir(svc);
+    send('download', `Downloading ${svc.repo_url} → ${dir}`);
+
     const result = await cloneOrPullService(svc);
     if (!result.success) return end(false, result.message);
-
     send('extract', result.message);
+
+    // Verify files actually landed
+    let fileCount = 0;
+    try {
+      fileCount = fs.readdirSync(dir).length;
+    } catch (e) {
+      send('verify', `WARNING: Could not read dir ${dir}: ${e.message}`, true);
+    }
+    send('verify', `Dir: ${dir} — ${fileCount} items found`);
 
     send('install', 'Installing dependencies...');
     await installDeps(svc).catch(e => send('install', `Dep warning: ${e.message}`));
@@ -563,7 +573,7 @@ app.post('/api/services/:id/deploy', requireAuth, async (req, res) => {
       [svc.id, result.message]
     ).catch(() => {});
 
-    end(true, `Deployed successfully`);
+    end(true, `Deployed — ${fileCount} files in ${dir}`);
   } catch (e) {
     await d1.query(
       `INSERT INTO deploy_log (service_id, status, message, triggered_by) VALUES (?, 'failed', ?, 'manual')`,
@@ -836,6 +846,32 @@ app.post('/api/gc', requireAuth, async (req, res) => {
 
 app.get('/api/brain/events', requireAuth, (req, res) => {
   res.json({ events: brain.getEvents() });
+});
+
+// ─────────────────────────────────────────────────────
+// DEBUG — inspect disk state for a service
+// ─────────────────────────────────────────────────────
+app.get('/api/services/:id/debug', requireAuth, async (req, res) => {
+  try {
+    const svc = await getService(req.params.id);
+    if (!svc) return res.status(404).json({ error: 'Not found' });
+    const dir = getServiceDir(svc);
+    const exists = fs.existsSync(dir);
+    let files = [];
+    if (exists) {
+      try { files = fs.readdirSync(dir); } catch (e) { files = [`READ ERROR: ${e.message}`]; }
+    }
+    res.json({
+      serviceId: svc.id,
+      dir,
+      exists,
+      fileCount: files.length,
+      files,
+      SERVICES_DIR,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─────────────────────────────────────────────────────
