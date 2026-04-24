@@ -236,20 +236,26 @@ async function cloneOrPullService(service) {
 
   // ── Move contents out of the GitHub-generated subfolder ─────────────────
   // GitHub ZIPs always extract to: {repo}-{branch}/ or {repo}-{sha}/
-  // We need to find that single top-level dir and move its contents.
+  // We use cp -r instead of fs.renameSync because /tmp and /services are
+  // different mount points inside Docker — renameSync throws EXDEV across mounts.
   try {
-    const entries    = fs.readdirSync(tmpDir);
-    const subFolder  = entries.find(e => fs.statSync(path.join(tmpDir, e)).isDirectory());
+    const entries   = fs.readdirSync(tmpDir);
+    const subFolder = entries.find(e => fs.statSync(path.join(tmpDir, e)).isDirectory());
     if (!subFolder) throw new Error('No directory found inside ZIP');
 
     const extractedPath = path.join(tmpDir, subFolder);
 
-    // Overwrite existing service dir cleanly
+    // Wipe existing service dir, recreate parent
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(path.dirname(dir), { recursive: true });
 
-    // Move extracted folder to final service dir
-    fs.renameSync(extractedPath, dir);
+    // Cross-device safe copy then delete source
+    await new Promise((resolve, reject) => {
+      exec(`cp -r "${extractedPath}/." "${dir}"`, { env: process.env }, (err, _stdout, stderr) => {
+        if (err) return reject(new Error(stderr || err.message));
+        resolve();
+      });
+    });
   } catch (e) {
     fs.rmSync(tmpZip, { force: true });
     fs.rmSync(tmpDir, { recursive: true, force: true });
