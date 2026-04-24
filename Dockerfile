@@ -38,9 +38,6 @@ RUN node -e "require('/dashboard/node_modules/ws'); console.log('ws OK')"
 # ── Copy dashboard source ──
 COPY dashboard/ /dashboard/
 
-# ── Copy server-brain ──
-COPY server-brain/ /server-brain/
-
 # ── Copy start script ──
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
