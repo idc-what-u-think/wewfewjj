@@ -33,7 +33,7 @@ module.exports = {
     out_file: '/var/log/firekid/dashboard.out.log',
     error_file: '/var/log/firekid/dashboard.err.log',
     merge_logs: true,
-    node_args: '--max-old-space-size=512',
+    node_args: '--max-old-space-size=512 --expose-gc',
     env: {
       DASHBOARD_PORT: process.env.DASHBOARD_PORT || '3000',
       DASHBOARD_USERNAME: process.env.DASHBOARD_USERNAME,
