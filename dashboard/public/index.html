@@ -542,6 +542,7 @@
       <div class="flex items-center gap-8">
         <div class="status-dot running" id="server-status-dot"></div>
         <span class="text-sm text-muted" id="server-status-text">Online</span>
+        <button class="btn btn-ghost btn-sm" id="gc-btn" onclick="cleanMemory()" title="Force GC + clean PM2 ghosts + rotate logs">🧹 Clean RAM</button>
         <button class="btn btn-ghost btn-sm" onclick="doLogout()">Logout</button>
       </div>
     </div>
@@ -1534,12 +1535,9 @@ async function submitAddService() {
 
   try {
     const res = await api('POST', '/api/services', data);
-    notify(`${data.name} created`, 'success');
+    notify(`${data.name} created. Click Start when ready.`, 'success');
     closeModal('add-service-modal');
     await loadServices();
-    if (data.repo_url) {
-      await serviceAction(res.id, 'deploy');
-    }
     navigate('services');
   } catch (e) {
     notify(e.message, 'error');
@@ -1583,6 +1581,45 @@ function fmtUptime(seconds) {
   if (d > 0) return `${d}d ${h}h`;
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
+}
+
+// ─────────────────────────────────────────────────────
+// CLEAN MEMORY
+// ─────────────────────────────────────────────────────
+async function cleanMemory() {
+  const btn = document.getElementById('gc-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Cleaning...';
+  try {
+    const result = await api('POST', '/api/gc');
+    notify(`Cleaned: ${result.pm2Ghosts} ghosts · ${result.logsRotated} logs trimmed · Dashboard GC: ${result.dashboardGC}`, 'success');
+  } catch (e) {
+    notify('Clean failed: ' + e.message, 'error');
+  }
+  btn.disabled = false;
+  btn.textContent = '🧹 Clean RAM';
+}
+
+// ─────────────────────────────────────────────────────
+// BRAIN EVENTS (via WebSocket)
+// ─────────────────────────────────────────────────────
+function handleBrainEvent(payload) {
+  if (payload.type !== 'brain') return;
+  const { event, message } = payload;
+  if (!message) return;
+
+  const level =
+    event === 'memory_hard' || event === 'suspended'   ? 'error'   :
+    event === 'memory_warn'                             ? 'warning' :
+    event === 'worker_unreachable'                      ? 'warning' :
+    'info';
+
+  notify(`[Brain] ${message}`, level);
+
+  // Refresh service list on suspension or memory kill so status updates
+  if (event === 'suspended' || event === 'memory_hard') {
+    loadServices().catch(() => {});
+  }
 }
 
 // ─────────────────────────────────────────────────────
