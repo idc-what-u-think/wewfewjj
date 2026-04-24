@@ -732,6 +732,12 @@ async function api(method, path, body) {
   const opts = { method, headers: { 'Content-Type': 'application/json' }, credentials: 'include' };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(path, opts);
+  const ct = res.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) {
+    // Server returned non-JSON (HTML error page, redirect, etc.)
+    const text = await res.text();
+    throw new Error(`Server error (${res.status}): ${text.slice(0, 120)}`);
+  }
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
@@ -962,9 +968,67 @@ function renderServiceRow(svc, detailed = false) {
 
 async function serviceAction(id, action) {
   const svc = state.services.find(s => s.id === id);
+  const name = svc?.name || id;
+
+  // Deploy uses SSE streaming — show live progress
+  if (action === 'deploy') {
+    notify(`${name}: deploying…`, 'info');
+    try {
+      await new Promise((resolve, reject) => {
+        const es = new EventSource(`/api/services/${id}/deploy`, { withCredentials: true });
+
+        // EventSource doesn't support POST natively — we use fetch + manual SSE parse
+        es.close();
+
+        // Manual SSE via fetch for POST
+        fetch(`/api/services/${id}/deploy`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+        }).then(async (res) => {
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop(); // keep incomplete line
+
+            for (const line of lines) {
+              if (!line.startsWith('data:')) continue;
+              try {
+                const payload = JSON.parse(line.slice(5).trim());
+                if (payload.done) {
+                  if (payload.success) {
+                    notify(`${name}: ${payload.message}`, 'success');
+                    resolve();
+                  } else {
+                    notify(`${name}: ${payload.message}`, 'error');
+                    reject(new Error(payload.message));
+                  }
+                } else {
+                  notify(`${name} [${payload.step}]: ${payload.message}`, payload.error ? 'error' : 'info');
+                }
+              } catch {}
+            }
+          }
+        }).catch(reject);
+      });
+    } catch {}
+
+    await loadServices();
+    if (state.page === 'overview') renderOverviewPage();
+    else if (state.page === 'services') renderServicesPage();
+    return;
+  }
+
+  // All other actions — standard JSON API
   try {
-    const res = await api('POST', `/api/services/${id}/${action}`);
-    notify(`${svc?.name || id}: ${action} successful`, 'success');
+    await api('POST', `/api/services/${id}/${action}`);
+    notify(`${name}: ${action} successful`, 'success');
     await loadServices();
     if (state.page === 'overview') renderOverviewPage();
     else if (state.page === 'services') renderServicesPage();
