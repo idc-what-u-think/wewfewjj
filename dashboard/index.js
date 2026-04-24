@@ -2,7 +2,7 @@
 // Express server handling auth, proxy, API, terminals, logs, files
 
 require('dotenv').config();
-const brain = require('../server-brain');
+const brain = require('./server-brain');
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
