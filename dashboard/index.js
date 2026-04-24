@@ -2,6 +2,7 @@
 // Express server handling auth, proxy, API, terminals, logs, files
 
 require('dotenv').config();
+const brain = require('../server-brain');
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -10,6 +11,8 @@ const cookieParser = require('cookie-parser');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const multer = require('multer');
 const pty = require('node-pty');
+// pm2 is managed exclusively by server-brain/pm2-bridge.js
+// Never call pm2.connect() here — brain connects once on init
 const pm2 = require('pm2');
 const axios = require('axios');
 const si = require('systeminformation');
@@ -17,7 +20,7 @@ const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
 const { execSync, exec, spawn } = require('child_process');
-const simpleGit = require('simple-git');
+// simple-git removed — cloneOrPullService now uses GitHub ZIP download via axios
 
 const app = express();
 const server = http.createServer(app);
@@ -119,40 +122,13 @@ app.get('/auth/me', (req, res) => {
 // ─────────────────────────────────────────────────────
 // PM2 HELPERS
 // ─────────────────────────────────────────────────────
-
-function pm2Connect() {
-  return new Promise((resolve, reject) => {
-    pm2.connect((err) => err ? reject(err) : resolve());
-  });
-}
+// NOTE: pm2Connect / pm2Start / pm2Stop / pm2Delete / pm2Restart are
+// intentionally removed. All service lifecycle goes through server-brain.
+// pm2List is kept only for /api/status enrichment (connection is held by brain).
 
 function pm2List() {
   return new Promise((resolve, reject) => {
-    pm2.list((err, list) => err ? reject(err) : resolve(list));
-  });
-}
-
-function pm2Start(opts) {
-  return new Promise((resolve, reject) => {
-    pm2.start(opts, (err, apps) => err ? reject(err) : resolve(apps));
-  });
-}
-
-function pm2Stop(name) {
-  return new Promise((resolve, reject) => {
-    pm2.stop(name, (err) => err ? reject(err) : resolve());
-  });
-}
-
-function pm2Delete(name) {
-  return new Promise((resolve, reject) => {
-    pm2.delete(name, (err) => err ? reject(err) : resolve());
-  });
-}
-
-function pm2Restart(name) {
-  return new Promise((resolve, reject) => {
-    pm2.restart(name, (err) => err ? reject(err) : resolve());
+    pm2.list((err, list) => (err ? reject(err) : resolve(list)));
   });
 }
 
@@ -189,28 +165,103 @@ function getServiceDir(service) {
 }
 
 async function cloneOrPullService(service) {
-  const dir = getServiceDir(service);
-  let repoUrl = service.repo_url;
-
-  if (service.pat_key) {
-    const token = await getToken(service.pat_key);
-    if (token && repoUrl) {
-      repoUrl = repoUrl.replace('https://', `https://${token}@`);
-    }
-  }
-
+  const dir     = getServiceDir(service);
+  let   repoUrl = service.repo_url;
   if (!repoUrl) return { success: false, message: 'No repo URL configured' };
 
-  const git = simpleGit();
-
-  if (fs.existsSync(path.join(dir, '.git'))) {
-    await git.cwd(dir).pull('origin', service.branch || 'main');
-    return { success: true, message: 'Pulled latest changes' };
-  } else {
-    fs.mkdirSync(dir, { recursive: true });
-    await git.clone(repoUrl, dir, ['--branch', service.branch || 'main', '--depth', '1']);
-    return { success: true, message: 'Cloned repository' };
+  // ── Resolve PAT token ────────────────────────────────────────────────────
+  let pat = null;
+  if (service.pat_key) {
+    const token = await getToken(service.pat_key);
+    if (token) pat = token;
   }
+
+  // ── Build GitHub ZIP download URL ────────────────────────────────────────
+  // Accepts:  https://github.com/owner/repo
+  //           https://github.com/owner/repo.git
+  const match = repoUrl.replace(/\.git$/, '').match(/github\.com[/:]([^/]+)\/([^/]+)/);
+  if (!match) return { success: false, message: 'Only GitHub repos are supported (https://github.com/owner/repo)' };
+
+  const [, owner, repo] = match;
+  const branch  = service.branch || 'main';
+  const zipUrl  = `https://github.com/${owner}/${repo}/archive/refs/heads/${branch}.zip`;
+  const tmpZip  = `/tmp/svc-${service.id}.zip`;
+  const tmpDir  = `/tmp/svc-${service.id}-extract`;
+
+  // ── Download ZIP ─────────────────────────────────────────────────────────
+  try {
+    const headers = { 'User-Agent': 'firekid-server/1.0' };
+    if (pat) headers['Authorization'] = `token ${pat}`;
+
+    const response = await axios.get(zipUrl, {
+      responseType: 'stream',
+      headers,
+      maxRedirects: 5,
+      timeout: 120_000, // 2 min
+    });
+
+    await new Promise((resolve, reject) => {
+      const writer = fs.createWriteStream(tmpZip);
+      response.data.pipe(writer);
+      writer.on('finish', resolve);
+      writer.on('error', reject);
+      response.data.on('error', reject);
+    });
+  } catch (e) {
+    // Clean up partial zip
+    fs.rmSync(tmpZip, { force: true });
+    const status = e.response?.status;
+    if (status === 401 || status === 403) return { success: false, message: 'Unauthorised — check your PAT token has repo access.' };
+    if (status === 404) return { success: false, message: `Repo not found: ${owner}/${repo} (branch: ${branch})` };
+    return { success: false, message: `Download failed: ${e.message}` };
+  }
+
+  // ── Extract ZIP ──────────────────────────────────────────────────────────
+  try {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.mkdirSync(tmpDir, { recursive: true });
+    fs.mkdirSync(dir,    { recursive: true });
+
+    await new Promise((resolve, reject) => {
+      exec(`unzip -o "${tmpZip}" -d "${tmpDir}"`, (err, _stdout, stderr) => {
+        if (err) return reject(new Error(stderr || err.message));
+        resolve();
+      });
+    });
+  } catch (e) {
+    fs.rmSync(tmpZip, { force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    return { success: false, message: `Extraction failed: ${e.message}` };
+  }
+
+  // ── Move contents out of the GitHub-generated subfolder ─────────────────
+  // GitHub ZIPs always extract to: {repo}-{branch}/ or {repo}-{sha}/
+  // We need to find that single top-level dir and move its contents.
+  try {
+    const entries    = fs.readdirSync(tmpDir);
+    const subFolder  = entries.find(e => fs.statSync(path.join(tmpDir, e)).isDirectory());
+    if (!subFolder) throw new Error('No directory found inside ZIP');
+
+    const extractedPath = path.join(tmpDir, subFolder);
+
+    // Overwrite existing service dir cleanly
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(dir), { recursive: true });
+
+    // Move extracted folder to final service dir
+    fs.renameSync(extractedPath, dir);
+  } catch (e) {
+    fs.rmSync(tmpZip, { force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    return { success: false, message: `Move failed: ${e.message}` };
+  }
+
+  // ── Cleanup temp files ───────────────────────────────────────────────────
+  fs.rmSync(tmpZip, { force: true });
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+
+  const isUpdate = fs.existsSync(path.join(dir, '.git')) === false;
+  return { success: true, message: `Downloaded and extracted ${owner}/${repo}@${branch}` };
 }
 
 function detectLanguage(dir) {
@@ -246,59 +297,14 @@ async function installDeps(service) {
   });
 }
 
-async function startServiceProcess(service) {
-  const dir = getServiceDir(service);
-  const envVars = JSON.parse(service.env_vars || '{}');
-  const envFile = path.join(dir, '.env');
-
-  if (fs.existsSync(envFile)) {
-    const lines = fs.readFileSync(envFile, 'utf-8').split('\n');
-    lines.forEach(line => {
-      const [key, ...vals] = line.split('=');
-      if (key && key.trim()) envVars[key.trim()] = vals.join('=').trim();
-    });
-  }
-
-  // Ensure dirs exist
-  fs.mkdirSync(dir, { recursive: true });
-  fs.mkdirSync('/var/log/firekid', { recursive: true });
-
-  // Parse start_command into script + args so PM2 handles it correctly
-  // e.g. "node index.js" -> script:"node", args:"index.js"
-  // e.g. "npm start"     -> script:"npm",  args:"start"
-  const parts = service.start_command.trim().split(/\s+/);
-  const script = parts[0];
-  const args = parts.slice(1).join(' ');
-
-  await pm2Connect();
-
-  // Delete any old crashed instance first to avoid ghost processes eating RAM
-  await pm2Delete(service.id).catch(() => {});
-
-  await pm2Start({
-    name: service.id,
-    script,
-    args: args || undefined,
-    cwd: dir,
-    env: { ...process.env, ...envVars, PORT: service.port },
-    autorestart: service.auto_restart === 1,
-    max_restarts: 5,
-    min_uptime: '10s',
-    exp_backoff_restart_delay: 500,
-    kill_timeout: 5000,
-    out_file: `/var/log/firekid/${service.id}.out.log`,
-    error_file: `/var/log/firekid/${service.id}.err.log`,
-    merge_logs: true,
-  });
-
-  await d1.query('UPDATE services SET status = ?, updated_at = datetime(\'now\') WHERE id = ?', ['running', service.id]);
+// startServiceProcess is now handled by brain.startService(svc).
+// Left as a thin shim so deploy/webhook paths remain readable.
+async function startServiceProcess(svc) {
+  return brain.startService(svc);
 }
 
-async function stopServiceProcess(service) {
-  await pm2Connect();
-  try { await pm2Stop(service.id); } catch {}
-  try { await pm2Delete(service.id); } catch {}
-  await d1.query('UPDATE services SET status = ?, updated_at = datetime(\'now\') WHERE id = ?', ['stopped', service.id]);
+async function stopServiceProcess(svc) {
+  return brain.stopService(svc);
 }
 
 // ─────────────────────────────────────────────────────
@@ -503,10 +509,7 @@ app.post('/api/services/:id/restart', requireAuth, async (req, res) => {
   try {
     const svc = await getService(req.params.id);
     if (!svc) return res.status(404).json({ error: 'Service not found' });
-    await pm2Connect();
-    await pm2Restart(svc.id).catch(async () => {
-      await startServiceProcess(svc);
-    });
+    await brain.restartService(svc);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -514,31 +517,53 @@ app.post('/api/services/:id/restart', requireAuth, async (req, res) => {
 });
 
 app.post('/api/services/:id/deploy', requireAuth, async (req, res) => {
+  // ── SSE streaming deploy — client sees each step live ────────────────────
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection',    'keep-alive');
+  res.flushHeaders();
+
+  const send = (step, message, error = false) => {
+    try {
+      res.write(`data: ${JSON.stringify({ step, message, error, ts: Date.now() })}\n\n`);
+    } catch {}
+  };
+
+  const end = (success, message) => {
+    try {
+      res.write(`data: ${JSON.stringify({ done: true, success, message, ts: Date.now() })}\n\n`);
+      res.end();
+    } catch {}
+  };
+
   try {
     const svc = await getService(req.params.id);
-    if (!svc) return res.status(404).json({ error: 'Service not found' });
+    if (!svc) return end(false, 'Service not found');
 
+    send('download', `Downloading ${svc.repo_url}...`);
     const result = await cloneOrPullService(svc);
-    if (!result.success) return res.status(400).json({ error: result.message });
+    if (!result.success) return end(false, result.message);
 
-    await installDeps(svc).catch(() => {});
-    await pm2Connect();
-    await pm2Restart(svc.id).catch(async () => {
-      await startServiceProcess(svc);
-    });
+    send('extract', result.message);
+
+    send('install', 'Installing dependencies...');
+    await installDeps(svc).catch(e => send('install', `Dep warning: ${e.message}`));
+
+    send('start', 'Starting service...');
+    await brain.restartService(svc);
 
     await d1.query(
       `INSERT INTO deploy_log (service_id, status, message, triggered_by) VALUES (?, 'success', ?, 'manual')`,
       [svc.id, result.message]
-    );
+    ).catch(() => {});
 
-    res.json({ success: true, message: result.message });
+    end(true, `Deployed successfully`);
   } catch (e) {
     await d1.query(
       `INSERT INTO deploy_log (service_id, status, message, triggered_by) VALUES (?, 'failed', ?, 'manual')`,
       [req.params.id, e.message]
     ).catch(() => {});
-    res.status(500).json({ error: e.message });
+    end(false, e.message);
   }
 });
 
@@ -713,41 +738,8 @@ app.get('/api/services/:id/logs', requireAuth, async (req, res) => {
   try {
     const svc = await getService(req.params.id);
     if (!svc) return res.status(404).json({ error: 'Service not found' });
-
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders();
-
-    const logFile = `/var/log/firekid/${svc.id}.out.log`;
-    const errFile = `/var/log/firekid/${svc.id}.err.log`;
-
-    // Create log files if they don't exist yet so tail -f doesn't silently fail
-    fs.mkdirSync('/var/log/firekid', { recursive: true });
-    if (!fs.existsSync(logFile)) fs.writeFileSync(logFile, '');
-    if (!fs.existsSync(errFile)) fs.writeFileSync(errFile, '');
-
-    const send = (data) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {} };
-
-    // Send last 100 lines first
-    try {
-      const lines = fs.readFileSync(logFile, 'utf-8').split('\n').slice(-100);
-      lines.forEach(line => line && send({ type: 'out', message: line, time: Date.now() }));
-      const errLines = fs.readFileSync(errFile, 'utf-8').split('\n').slice(-50);
-      errLines.forEach(line => line && send({ type: 'err', message: line, time: Date.now() }));
-    } catch {}
-
-    // Tail live
-    const tail = spawn('tail', ['-f', '-n', '0', logFile], { stdio: ['ignore', 'pipe', 'pipe'] });
-    const tailErr = spawn('tail', ['-f', '-n', '0', errFile], { stdio: ['ignore', 'pipe', 'pipe'] });
-
-    tail.stdout.on('data', d => d.toString().split('\n').filter(Boolean).forEach(line => send({ type: 'out', message: line, time: Date.now() })));
-    tailErr.stdout.on('data', d => d.toString().split('\n').filter(Boolean).forEach(line => send({ type: 'err', message: line, time: Date.now() })));
-
-    req.on('close', () => {
-      try { tail.kill(); } catch {}
-      try { tailErr.kill(); } catch {}
-    });
+    // brain.pipeLogs owns tail lifecycle — kills old tail, spawns new, cleans on disconnect
+    brain.pipeLogs(svc.id, req, res);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -820,6 +812,27 @@ app.post('/api/settings', requireAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────
+// API — CLEAN MEMORY (manual GC trigger)
+// ─────────────────────────────────────────────────────
+
+app.post('/api/gc', requireAuth, async (req, res) => {
+  try {
+    const result = await brain.gc();
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// API — BRAIN EVENTS (last N events from brain log)
+// ─────────────────────────────────────────────────────
+
+app.get('/api/brain/events', requireAuth, (req, res) => {
+  res.json({ events: brain.getEvents() });
+});
+
+// ─────────────────────────────────────────────────────
 // WEBHOOK — auto-deploy on GitHub push
 // ─────────────────────────────────────────────────────
 
@@ -841,12 +854,11 @@ app.post('/webhook/:serviceId', express.raw({ type: 'application/json' }), async
 
     res.json({ ok: true });
 
-    // Deploy async
+    // Deploy async — brain.restartService handles RAM gate + crash budget
     cloneOrPullService(svc)
       .then(() => installDeps(svc).catch(() => {}))
       .then(async () => {
-        await pm2Connect();
-        await pm2Restart(svc.id).catch(async () => { await startServiceProcess(svc); });
+        await brain.restartService(svc);
         await d1.query(`INSERT INTO deploy_log (service_id, status, message, triggered_by) VALUES (?, 'success', 'Auto-deployed from webhook', 'webhook')`, [svc.id]);
       })
       .catch(async (e) => {
@@ -955,26 +967,32 @@ async function startup() {
   fs.mkdirSync(SERVICES_DIR, { recursive: true });
   fs.mkdirSync('/var/log/firekid', { recursive: true });
 
-  console.log('Connecting to pm2...');
-  await pm2Connect().catch(err => console.error('pm2 connect error:', err));
+  console.log('Initialising server-brain...');
+  await brain.init({ d1, kv, wss });
+  // brain.init() calls pm2Bridge.connect() — never call pm2.connect() again after this
 
   console.log('Loading proxy routes...');
   await rebuildProxy().catch(err => console.error('proxy error:', err));
 
-  console.log('Restoring running services...');
+  // Start the HTTP server immediately — don't block on service restores
+  server.listen(PORT, () => {
+    console.log(`Dashboard running on port ${PORT}`);
+  });
+
+  // Restore previously-running services in the background, staggered by brain's queue
+  console.log('Restoring running services (staggered)...');
   const services = await getServices().catch(() => []);
   for (const svc of services) {
     if (svc.status === 'running') {
       const dir = getServiceDir(svc);
       if (fs.existsSync(dir)) {
-        await startServiceProcess(svc).catch(e => console.error(`Failed to start ${svc.name}:`, e.message));
+        // Fire-and-forget — brain queue staggers these 8s apart
+        brain.startService(svc).catch(e =>
+          console.error(`[startup] Failed to restore ${svc.name}: ${e.message}`)
+        );
       }
     }
   }
-
-  server.listen(PORT, () => {
-    console.log(`Dashboard running on port ${PORT}`);
-  });
 }
 
 startup().catch(console.error);
