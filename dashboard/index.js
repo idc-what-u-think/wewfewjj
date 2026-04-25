@@ -20,6 +20,7 @@ const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
 const { execSync, exec: shellExec, spawn } = require('child_process');
+const crypto = require('crypto');
 // simple-git removed — cloneOrPullService now uses GitHub ZIP download via axios
 
 const app = express();
@@ -268,7 +269,6 @@ async function cloneOrPullService(service) {
   fs.rmSync(tmpZip, { force: true });
   fs.rmSync(tmpDir, { recursive: true, force: true });
 
-  const isUpdate = fs.existsSync(path.join(dir, '.git')) === false;
   return { success: true, message: `Downloaded and extracted ${owner}/${repo}@${branch}` };
 }
 
@@ -299,10 +299,17 @@ async function installDeps(service) {
   const dir = getServiceDir(service);
   const lang = service.language || detectLanguage(dir);
   const cmd = getInstallCommand(lang, dir);
-  if (!cmd) return;
-  await new Promise((resolve, reject) => {
-    exec(cmd, { cwd: dir }, (err) => err ? reject(err) : resolve());
-  });
+  if (cmd) {
+    await new Promise((resolve, reject) => {
+      shellExec(cmd, { cwd: dir }, (err) => err ? reject(err) : resolve());
+    });
+  }
+  // Run build command if configured
+  if (service.build_command) {
+    await new Promise((resolve, reject) => {
+      shellExec(service.build_command, { cwd: dir }, (err) => err ? reject(err) : resolve());
+    });
+  }
 }
 
 // startServiceProcess is now handled by brain.startService(svc).
@@ -429,7 +436,7 @@ app.get('/api/services', requireAuth, async (req, res) => {
 
 app.post('/api/services', requireAuth, async (req, res) => {
   try {
-    const { name, repo_url, branch, pat_key, start_command, path_prefix, port, language, auto_restart, env_vars } = req.body;
+    const { name, repo_url, branch, pat_key, start_command, build_command, path_prefix, port, language, auto_restart, env_vars } = req.body;
 
     if (!name || !start_command || !path_prefix || !port) {
       return res.status(400).json({ error: 'name, start_command, path_prefix, port are required' });
@@ -440,9 +447,9 @@ app.post('/api/services', requireAuth, async (req, res) => {
     fs.mkdirSync(dir, { recursive: true });
 
     await d1.query(
-      `INSERT INTO services (id, name, repo_url, branch, pat_key, start_command, path_prefix, port, language, auto_restart, env_vars)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, name, repo_url || null, branch || 'main', pat_key || null, start_command, path_prefix, parseInt(port), language || 'node', auto_restart !== false ? 1 : 0, JSON.stringify(env_vars || {})]
+      `INSERT INTO services (id, name, repo_url, branch, pat_key, start_command, build_command, path_prefix, port, language, auto_restart, env_vars)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, name, repo_url || null, branch || 'main', pat_key || null, start_command, build_command || null, path_prefix, parseInt(port), language || 'node', auto_restart !== false ? 1 : 0, JSON.stringify(env_vars || {})]
     );
 
     await rebuildProxy();
@@ -455,11 +462,11 @@ app.post('/api/services', requireAuth, async (req, res) => {
 app.put('/api/services/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, repo_url, branch, pat_key, start_command, path_prefix, port, language, auto_restart } = req.body;
+    const { name, repo_url, branch, pat_key, start_command, build_command, path_prefix, port, language, auto_restart } = req.body;
 
     await d1.query(
-      `UPDATE services SET name=?, repo_url=?, branch=?, pat_key=?, start_command=?, path_prefix=?, port=?, language=?, auto_restart=?, updated_at=datetime('now') WHERE id=?`,
-      [name, repo_url || null, branch || 'main', pat_key || null, start_command, path_prefix, parseInt(port), language || 'node', auto_restart !== false ? 1 : 0, id]
+      `UPDATE services SET name=?, repo_url=?, branch=?, pat_key=?, start_command=?, build_command=?, path_prefix=?, port=?, language=?, auto_restart=?, updated_at=datetime('now') WHERE id=?`,
+      [name, repo_url || null, branch || 'main', pat_key || null, start_command, build_command || null, path_prefix, parseInt(port), language || 'node', auto_restart !== false ? 1 : 0, id]
     );
 
     await rebuildProxy();
@@ -565,7 +572,7 @@ app.post('/api/services/:id/deploy', requireAuth, async (req, res) => {
     send('verify', `Dir: ${dir} — ${fileCount} items found`);
 
     send('install', 'Installing dependencies...');
-    await installDeps(svc).catch(e => send('install', `Dep warning: ${e.message}`));
+    await installDeps(svc);
 
     send('start', 'Starting service...');
     await brain.restartService(svc);
@@ -575,12 +582,14 @@ app.post('/api/services/:id/deploy', requireAuth, async (req, res) => {
       [svc.id, result.message]
     ).catch(() => {});
 
+    await sendNotification('deploy', { success: true, name: svc.name, message: `Deployed — ${fileCount} files` });
     end(true, `Deployed — ${fileCount} files in ${dir}`);
   } catch (e) {
     await d1.query(
       `INSERT INTO deploy_log (service_id, status, message, triggered_by) VALUES (?, 'failed', ?, 'manual')`,
       [req.params.id, e.message]
     ).catch(() => {});
+    await sendNotification('deploy', { success: false, name: req.params.id, message: e.message });
     end(false, e.message);
   }
 });
@@ -851,6 +860,54 @@ app.get('/api/brain/events', requireAuth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────
+// API — BRAIN METRICS (history from KV)
+// ─────────────────────────────────────────────────────
+
+app.get('/api/brain/metrics', requireAuth, async (req, res) => {
+  try {
+    const raw = await kv.get('brain:metrics:history');
+    const history = raw ? JSON.parse(raw) : [];
+    res.json({ history });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// NOTIFY WEBHOOK HELPER
+// ─────────────────────────────────────────────────────
+
+async function sendNotification(type, payload) {
+  try {
+    const settings = await d1.query('SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?)', [
+      'notify_webhook', 'notify_on_deploy', 'notify_on_crash', 'server_label'
+    ]);
+    const s = {};
+    (settings.results || []).forEach(r => { s[r.key] = r.value; });
+
+    if (!s.notify_webhook) return;
+    if (type === 'deploy' && s.notify_on_deploy === 'false') return;
+    if (type === 'crash'  && s.notify_on_crash  === 'false') return;
+
+    const label = s.server_label || 'Firekid Server';
+    const color = type === 'deploy' ? (payload.success ? 0x2ecc71 : 0xe74c3c) : 0xe67e22;
+    const title = type === 'deploy'
+      ? (payload.success ? `✅ Deploy succeeded — ${payload.name}` : `❌ Deploy failed — ${payload.name}`)
+      : `⚠️ Crash — ${payload.name}`;
+
+    await axios.post(s.notify_webhook, {
+      embeds: [{
+        title,
+        description: payload.message || '',
+        color,
+        footer: { text: label },
+        timestamp: new Date().toISOString(),
+      }]
+    }, { timeout: 5000 }).catch(() => {});
+  } catch {}
+}
+
+// ─────────────────────────────────────────────────────
 // DEBUG — inspect disk state for a service
 // ─────────────────────────────────────────────────────
 app.get('/api/services/:id/debug', requireAuth, async (req, res) => {
@@ -889,7 +946,6 @@ app.post('/webhook/:serviceId', express.raw({ type: 'application/json' }), async
     const secret = settings.results?.[0]?.value;
 
     if (secret) {
-      const crypto = require('crypto');
       const sig = req.headers['x-hub-signature-256'];
       const hmac = crypto.createHmac('sha256', secret);
       const digest = 'sha256=' + hmac.update(req.body).digest('hex');
@@ -1012,7 +1068,7 @@ async function startup() {
   fs.mkdirSync('/var/log/firekid', { recursive: true });
 
   console.log('Initialising server-brain...');
-  await brain.init({ d1, kv, wss });
+  await brain.init({ d1, kv, wss, notify: sendNotification });
   // brain.init() calls pm2Bridge.connect() — never call pm2.connect() again after this
 
   console.log('Loading proxy routes...');
