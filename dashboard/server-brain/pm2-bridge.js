@@ -48,15 +48,14 @@ function restart(name) {
   });
 }
 
-// Delete all PM2 entries in errored state only.
-// Intentionally stopped services are left alone — brain.stopService handles their cleanup.
-// Returns the count of reaped entries.
+// Delete PM2 entries in errored/one-launch-crash state only.
+// Intentionally stopped services are left alone.
 async function reapGhosts() {
   const procs = await list().catch(() => []);
   let reaped = 0;
   for (const proc of procs) {
     const status = proc.pm2_env?.status;
-    if (status === 'errored') {
+    if (status === 'errored' || status === 'one-launch-crash') {
       await del(proc.name).catch(() => {});
       reaped++;
     }
