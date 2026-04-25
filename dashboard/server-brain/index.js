@@ -44,6 +44,7 @@ class Brain {
     // Internal event log (voice)
     this._events    = [];
     this._maxEvents = 100;
+    this._notify    = () => {};
 
     // Default max memory per service (overridden by D1 settings on init)
     this._defaultMaxMB = 200;
@@ -57,10 +58,11 @@ class Brain {
 
   // ─── Init ──────────────────────────────────────────────────────────────────
 
-  async init({ d1, kv, wss }) {
-    this._d1  = d1;
-    this._kv  = kv;
-    this._wss = wss;
+  async init({ d1, kv, wss, notify }) {
+    this._d1     = d1;
+    this._kv     = kv;
+    this._wss    = wss;
+    this._notify = notify || (() => {});
 
     this._crashes = new CrashTracker(d1);
     this._worker  = new WorkerBridge(kv, this);
@@ -114,8 +116,15 @@ class Brain {
     const validation = validateService(svc, SERVICES_DIR);
     if (!validation.ok) throw new Error(validation.reason);
 
-    const portCheck = await checkPortFree(svc.port);
-    if (!portCheck.ok) throw new Error(portCheck.reason);
+    // Skip port check if the service itself is already occupying that port (already online in PM2)
+    const procs = await pm2Bridge.list().catch(() => []);
+    const existing = procs.find(p => p.name === svc.id);
+    const alreadyOnline = existing?.pm2_env?.status === 'online';
+
+    if (!alreadyOnline) {
+      const portCheck = await checkPortFree(svc.port);
+      if (!portCheck.ok) throw new Error(portCheck.reason);
+    }
 
     // Enqueue with stagger. RAM gate runs inside the queue so it's
     // checked when it's actually this service's turn to start.
@@ -258,6 +267,7 @@ class Brain {
           type: 'brain', event: 'memory_hard', serviceId,
           message: `${info.name} hit ${mb}MB (limit ${maxMB}MB). Restarting.`,
         });
+        this._notify('crash', { name: info.name, message: `Memory hard limit hit: ${mb}MB / ${maxMB}MB. Service restarting.` }).catch(() => {});
 
         // Cancel any existing kill timer for this service
         const existing = this._killTimers.get(serviceId);
