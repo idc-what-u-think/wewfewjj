@@ -21,9 +21,13 @@ const MAX_SAMPLES       = 20;     // ~3 minutes of history per service
 function _readFile(p) {
   try {
     const raw = fs.readFileSync(p, 'utf-8').trim();
-    if (raw === 'max') return os.totalmem(); // unlimited container — use host total
+    // cgroup v2 unlimited = literal string "max"
+    if (raw === 'max') return os.totalmem();
     const val = parseInt(raw, 10);
-    return isNaN(val) ? null : val;
+    if (isNaN(val)) return null;
+    // cgroup v1 unlimited = astronomically large number (2^63 - 4096)
+    if (val > 9e18) return os.totalmem();
+    return val;
   } catch {
     return null;
   }
@@ -69,7 +73,17 @@ function getContainerMemory() {
 }
 
 function freeContainerMB() {
-  return Math.floor(getContainerMemory().freeBytes / 1024 / 1024);
+  const m = getContainerMemory();
+  // Subtract inactive_file from used — this is reclaimable page cache
+  // that the kernel will free under pressure, not real working memory.
+  let inactiveFileBytes = 0;
+  try {
+    const stat = fs.readFileSync('/sys/fs/cgroup/memory.stat', 'utf-8');
+    const match = stat.match(/inactive_file\s+(\d+)/);
+    if (match) inactiveFileBytes = parseInt(match[1], 10);
+  } catch {}
+  const workingSetBytes = Math.max(0, m.usedBytes - inactiveFileBytes);
+  return Math.floor((m.limitBytes - workingSetBytes) / 1024 / 1024);
 }
 
 function containerUsedPercent() {
