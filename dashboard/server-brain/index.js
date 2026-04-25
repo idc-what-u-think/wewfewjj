@@ -112,29 +112,21 @@ class Brain {
   // ─── Start ────────────────────────────────────────────────────────────────
 
   async startService(svc) {
-    // Pre-flight checks before queuing
     const validation = validateService(svc, SERVICES_DIR);
     if (!validation.ok) throw new Error(validation.reason);
 
-    // Skip port check if the service itself is already occupying that port
+    // Skip port check if this service is already holding the port (already online)
     const procs = await pm2Bridge.list().catch(() => []);
     const existing = procs.find(p => p.name === svc.id);
-    const alreadyOnline = existing?.pm2_env?.status === 'online';
-
-    if (!alreadyOnline) {
+    if (existing?.pm2_env?.status !== 'online') {
       const portCheck = await checkPortFree(svc.port);
       if (!portCheck.ok) throw new Error(portCheck.reason);
     }
 
-    // Enqueue with stagger. RAM gate runs inside the queue so it's
-    // checked when it's actually this service's turn to start.
     return this._queue.enqueue(async () => {
       const ram = checkRAMGate();
       if (!ram.ok) throw new Error(ram.reason);
-
-      // Clear crash budget on any manual start
       this._crashes.clear(svc.id);
-
       await this._doStart(svc);
     });
   }
@@ -159,61 +151,78 @@ class Brain {
 
     fs.mkdirSync('/var/log/firekid', { recursive: true });
 
-    const INTERPRETERS = ['node', 'python', 'python3', 'bun', 'ts-node', 'deno', 'php', 'ruby', 'perl'];
-    const PKG_RUNNERS  = ['npm', 'yarn', 'pnpm'];
-    const parts = svc.start_command.trim().split(/\s+/);
-    let script, args, interpreter;
-
-    if (INTERPRETERS.includes(parts[0])) {
-      // e.g. "node index.js --port 3000"
-      interpreter = parts[0]; // "node"
-      script      = parts[1]; // "index.js"
-      args        = parts.slice(2).join(' ') || undefined;
-    } else if (PKG_RUNNERS.includes(parts[0])) {
-      // e.g. "npm run start" — pass whole thing as script with none interpreter
-      interpreter = 'none';
-      script      = parts[0]; // "npm"
-      args        = parts.slice(1).join(' ') || undefined; // "run start"
-    } else {
-      // e.g. "./start.sh"
-      script      = parts[0];
-      args        = parts.slice(1).join(' ') || undefined;
-      interpreter = 'none';
-    }
-
-    // Per-service memory cap — use service override or global default
-    const maxMB   = (svc.max_memory_mb && parseInt(svc.max_memory_mb, 10) > 0)
+    // Per-service memory cap
+    const maxMB  = (svc.max_memory_mb && parseInt(svc.max_memory_mb, 10) > 0)
       ? parseInt(svc.max_memory_mb, 10)
       : this._defaultMaxMB;
+    const heapMB = Math.max(64, maxMB - 20);
 
-    // V8 heap cap slightly under RSS cap so GC runs before the process is killed
-    const heapMB  = Math.max(64, maxMB - 20);
+    // ── Correctly parse start_command into script + interpreter ──────────────
+    // PM2 rule (from docs):
+    //   - interpreter: the binary that runs the script (node, python3, etc.)
+    //   - script: the file passed to the interpreter
+    //   - For npm/yarn/pnpm: script='npm', args=['run','start'], interpreter='none'
+    //   - interpreter='none' means PM2 execs the script directly (needs shebang or be a binary)
+    const INTERPRETERS = ['node', 'python', 'python3', 'bun', 'ts-node', 'deno', 'php', 'ruby', 'perl'];
+    const PKG_RUNNERS  = ['npm', 'yarn', 'pnpm'];
+    const rawParts = svc.start_command.trim().split(/\s+/);
+    let script, args, interpreter, nodeArgs;
+
+    if (INTERPRETERS.includes(rawParts[0])) {
+      // e.g. "node index.js" → interpreter=node, script=index.js
+      interpreter = rawParts[0];
+      script      = rawParts[1];
+      args        = rawParts.slice(2);
+      nodeArgs    = interpreter === 'node' ? [`--max-old-space-size=${heapMB}`] : undefined;
+    } else if (PKG_RUNNERS.includes(rawParts[0])) {
+      // e.g. "npm run start" → script=npm, args=["run","start"], interpreter=none
+      interpreter = 'none';
+      script      = rawParts[0];
+      args        = rawParts.slice(1);
+      nodeArgs    = undefined;
+    } else {
+      // e.g. "./start.sh"
+      interpreter = 'none';
+      script      = rawParts[0];
+      args        = rawParts.slice(1);
+      nodeArgs    = undefined;
+    }
 
     // Delete any ghost entry before starting fresh
     await pm2Bridge.del(svc.id).catch(() => {});
 
     await pm2Bridge.start({
-      name:   svc.id,
+      name:        svc.id,
       script,
-      args:   args || undefined,
+      args:        args.length ? args : undefined,
       interpreter,
-      cwd:    dir,
-      env:    { ...process.env, ...envVars, PORT: String(svc.port) },
+      node_args:   nodeArgs,
+      cwd:         dir,
+      env:         { ...process.env, ...envVars, PORT: String(svc.port) },
       autorestart:               svc.auto_restart === 1,
       max_restarts:              3,
-      min_uptime:                '15s',
+      min_uptime:                3000,  // ms — short enough to detect real crashes fast
       exp_backoff_restart_delay: 3000,
       max_memory_restart:        `${maxMB}M`,
       kill_timeout:              5000,
-      node_args:                 interpreter === 'node' ? `--max-old-space-size=${heapMB}` : undefined,
       out_file:   `/var/log/firekid/${svc.id}.out.log`,
       error_file: `/var/log/firekid/${svc.id}.err.log`,
       merge_logs: true,
     });
 
-    // Grab new PID and register for monitoring
-    const procs = await pm2Bridge.list().catch(() => []);
-    const proc  = procs.find(p => p.name === svc.id);
+    // pm2.start() resolves when daemon ACKs — NOT when process is actually online.
+    // Poll up to 8s for real status so we can catch one-launch-crash early.
+    let proc = null;
+    for (let i = 0; i < 8; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      const list = await pm2Bridge.list().catch(() => []);
+      proc = list.find(p => p.name === svc.id);
+      if (proc?.pm2_env?.status === 'online' && proc.pid) break;
+      if (proc?.pm2_env?.status === 'errored' || proc?.pm2_env?.status === 'one-launch-crash') {
+        throw new Error(`Process failed immediately (status: ${proc.pm2_env.status}). Check Logs tab.`);
+      }
+    }
+
     if (proc?.pid) {
       this._registerService(svc.id, proc.pid, maxMB, svc.name);
     }
@@ -286,7 +295,7 @@ class Brain {
           type: 'brain', event: 'memory_hard', serviceId,
           message: `${info.name} hit ${mb}MB (limit ${maxMB}MB). Restarting.`,
         });
-        this._notify('crash', { name: info.name, message: `Memory hard limit: ${mb}MB / ${maxMB}MB. Restarting.` }).catch?.(() => {});
+        this._notify('crash', { name: info.name, message: `Memory hard limit: ${mb}MB / ${maxMB}MB` }).catch?.(() => {});
 
         // Cancel any existing kill timer for this service
         const existing = this._killTimers.get(serviceId);
