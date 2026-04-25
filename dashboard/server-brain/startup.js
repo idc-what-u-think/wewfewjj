@@ -49,6 +49,7 @@ function checkRAMGate() {
 }
 
 // Confirms the port isn't already bound by another process.
+// Pass skipIfName to allow the port if the only occupant is a known PM2 process.
 function checkPortFree(port) {
   return new Promise(resolve => {
     const srv = net.createServer();
