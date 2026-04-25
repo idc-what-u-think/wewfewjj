@@ -4,6 +4,7 @@
 // Per-service trend tracking and three-tier alerting thresholds.
 
 const fs = require('fs');
+const os = require('os');
 
 // Alert thresholds (MB). All configurable at brain init time.
 const SOFT_MB = 150; // Warn user — memory climbing
@@ -19,7 +20,9 @@ const MAX_SAMPLES       = 20;     // ~3 minutes of history per service
 
 function _readFile(p) {
   try {
-    const val = parseInt(fs.readFileSync(p, 'utf-8').trim(), 10);
+    const raw = fs.readFileSync(p, 'utf-8').trim();
+    if (raw === 'max') return os.totalmem(); // unlimited container — use host total
+    const val = parseInt(raw, 10);
     return isNaN(val) ? null : val;
   } catch {
     return null;
