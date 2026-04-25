@@ -21,7 +21,7 @@ const path = require('path');
 const fs = require('fs');
 const { execSync, exec: shellExec, spawn } = require('child_process');
 const crypto = require('crypto');
-// simple-git removed — cloneOrPullService now uses GitHub ZIP download via axios
+const os = require('os');
 
 const app = express();
 const server = http.createServer(app);
@@ -284,31 +284,45 @@ function detectLanguage(dir) {
 function getInstallCommand(language, dir) {
   switch (language) {
     case 'node': {
-      if (fs.existsSync(path.join(dir, 'bun.lockb'))) return 'bun install';
-      if (fs.existsSync(path.join(dir, 'yarn.lock'))) return 'yarn install';
-      if (fs.existsSync(path.join(dir, 'pnpm-lock.yaml'))) return 'pnpm install';
-      return 'npm install';
+      if (fs.existsSync(path.join(dir, 'bun.lockb')))      return ['bun',  ['install']];
+      if (fs.existsSync(path.join(dir, 'yarn.lock')))      return ['yarn', ['install', '--non-interactive']];
+      if (fs.existsSync(path.join(dir, 'pnpm-lock.yaml'))) return ['pnpm', ['install', '--no-frozen-lockfile']];
+      return ['npm', ['install', '--no-audit', '--no-fund', '--prefer-offline']];
     }
-    case 'python': return 'pip install -r requirements.txt';
-    case 'go': return 'go mod download';
-    default: return null;
+    case 'python': return ['pip', ['install', '-r', 'requirements.txt']];
+    case 'go':     return ['go',  ['mod', 'download']];
+    default:       return null;
   }
 }
 
-async function installDeps(service) {
-  const dir = getServiceDir(service);
+// Runs a command via spawn and pipes stdout/stderr to an optional SSE sender.
+// Returns a promise that rejects on non-zero exit.
+function runCommand(cmd, args, cwd, send) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { cwd, env: process.env });
+    child.stdout.on('data', d => send?.('install', d.toString().trim()));
+    child.stderr.on('data', d => send?.('install', d.toString().trim()));
+    child.on('error', reject);
+    child.on('close', code => {
+      if (code === 0) resolve();
+      else reject(new Error(`"${cmd} ${args.join(' ')}" exited with code ${code}`));
+    });
+  });
+}
+
+async function installDeps(service, send) {
+  const dir  = getServiceDir(service);
   const lang = service.language || detectLanguage(dir);
-  const cmd = getInstallCommand(lang, dir);
-  if (cmd) {
-    await new Promise((resolve, reject) => {
-      shellExec(cmd, { cwd: dir }, (err) => err ? reject(err) : resolve());
-    });
+  const installCmd = getInstallCommand(lang, dir);
+
+  if (installCmd) {
+    const [cmd, args] = installCmd;
+    await runCommand(cmd, args, dir, send);
   }
-  // Run build command if configured
-  if (service.build_command) {
-    await new Promise((resolve, reject) => {
-      shellExec(service.build_command, { cwd: dir }, (err) => err ? reject(err) : resolve());
-    });
+
+  if (service.build_command && service.build_command.trim()) {
+    const parts = service.build_command.trim().split(/\s+/);
+    await runCommand(parts[0], parts.slice(1), dir, send);
   }
 }
 
@@ -537,14 +551,20 @@ app.post('/api/services/:id/deploy', requireAuth, async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection',    'keep-alive');
   res.flushHeaders();
+  req.socket.setTimeout(0); // prevent 2min idle timeout killing SSE
+
+  let closed = false;
+  req.on('close', () => { closed = true; });
 
   const send = (step, message, error = false) => {
+    if (closed) return;
     try {
       res.write(`data: ${JSON.stringify({ step, message, error, ts: Date.now() })}\n\n`);
     } catch {}
   };
 
   const end = (success, message) => {
+    if (closed) return;
     try {
       res.write(`data: ${JSON.stringify({ done: true, success, message, ts: Date.now() })}\n\n`);
       res.end();
@@ -572,7 +592,7 @@ app.post('/api/services/:id/deploy', requireAuth, async (req, res) => {
     send('verify', `Dir: ${dir} — ${fileCount} items found`);
 
     send('install', 'Installing dependencies...');
-    await installDeps(svc);
+    await installDeps(svc, send);
 
     send('start', 'Starting service...');
     await brain.restartService(svc);
@@ -581,7 +601,6 @@ app.post('/api/services/:id/deploy', requireAuth, async (req, res) => {
       `INSERT INTO deploy_log (service_id, status, message, triggered_by) VALUES (?, 'success', ?, 'manual')`,
       [svc.id, result.message]
     ).catch(() => {});
-
     await sendNotification('deploy', { success: true, name: svc.name, message: `Deployed — ${fileCount} files` });
     end(true, `Deployed — ${fileCount} files in ${dir}`);
   } catch (e) {
@@ -860,7 +879,7 @@ app.get('/api/brain/events', requireAuth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────
-// API — BRAIN METRICS (history from KV)
+// API — BRAIN METRICS (KV history)
 // ─────────────────────────────────────────────────────
 
 app.get('/api/brain/metrics', requireAuth, async (req, res) => {
@@ -884,25 +903,16 @@ async function sendNotification(type, payload) {
     ]);
     const s = {};
     (settings.results || []).forEach(r => { s[r.key] = r.value; });
-
     if (!s.notify_webhook) return;
     if (type === 'deploy' && s.notify_on_deploy === 'false') return;
     if (type === 'crash'  && s.notify_on_crash  === 'false') return;
-
     const label = s.server_label || 'Firekid Server';
     const color = type === 'deploy' ? (payload.success ? 0x2ecc71 : 0xe74c3c) : 0xe67e22;
     const title = type === 'deploy'
       ? (payload.success ? `✅ Deploy succeeded — ${payload.name}` : `❌ Deploy failed — ${payload.name}`)
       : `⚠️ Crash — ${payload.name}`;
-
     await axios.post(s.notify_webhook, {
-      embeds: [{
-        title,
-        description: payload.message || '',
-        color,
-        footer: { text: label },
-        timestamp: new Date().toISOString(),
-      }]
+      embeds: [{ title, description: payload.message || '', color, footer: { text: label }, timestamp: new Date().toISOString() }]
     }, { timeout: 5000 }).catch(() => {});
   } catch {}
 }
@@ -946,7 +956,7 @@ app.post('/webhook/:serviceId', express.raw({ type: 'application/json' }), async
     const secret = settings.results?.[0]?.value;
 
     if (secret) {
-      const sig = req.headers['x-hub-signature-256'];
+      const sig  = req.headers['x-hub-signature-256'];
       const hmac = crypto.createHmac('sha256', secret);
       const digest = 'sha256=' + hmac.update(req.body).digest('hex');
       if (sig !== digest) return res.status(401).json({ error: 'Invalid signature' });
@@ -956,7 +966,7 @@ app.post('/webhook/:serviceId', express.raw({ type: 'application/json' }), async
 
     // Deploy async — brain.restartService handles RAM gate + crash budget
     cloneOrPullService(svc)
-      .then(() => installDeps(svc).catch(() => {}))
+      .then(() => installDeps(svc, null).catch(() => {}))
       .then(async () => {
         await brain.restartService(svc);
         await d1.query(`INSERT INTO deploy_log (service_id, status, message, triggered_by) VALUES (?, 'success', 'Auto-deployed from webhook', 'webhook')`, [svc.id]);
@@ -979,7 +989,15 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
     return;
   }
-  sessionMiddleware(req, {}, () => {
+  // express-session writes set-cookie via res.setHeader/writeHead/end.
+  // Passing {} causes TypeError if the session mutates. Use a safe stub.
+  const fakeRes = {
+    writeHead: () => {},
+    setHeader: () => {},
+    getHeader: () => {},
+    end:       () => {},
+  };
+  sessionMiddleware(req, fakeRes, () => {
     if (!req.session?.authenticated) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
@@ -1000,13 +1018,15 @@ wss.on('connection', (ws, req) => {
   let shell;
   let alive = true;
 
-  // Ping every 20s to keep connection open through proxies/CF tunnel
   const pingInterval = setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.ping();
-    } else {
+    if (!alive) {
+      // No pong received since last ping — connection is dead
+      ws.terminate();
       clearInterval(pingInterval);
+      return;
     }
+    alive = false;
+    if (ws.readyState === WebSocket.OPEN) ws.ping();
   }, 20000);
 
   ws.on('pong', () => { alive = true; });
