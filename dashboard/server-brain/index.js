@@ -116,7 +116,7 @@ class Brain {
     const validation = validateService(svc, SERVICES_DIR);
     if (!validation.ok) throw new Error(validation.reason);
 
-    // Skip port check if the service itself is already occupying that port (already online in PM2)
+    // Skip port check if the service itself is already occupying that port
     const procs = await pm2Bridge.list().catch(() => []);
     const existing = procs.find(p => p.name === svc.id);
     const alreadyOnline = existing?.pm2_env?.status === 'online';
@@ -159,9 +159,27 @@ class Brain {
 
     fs.mkdirSync('/var/log/firekid', { recursive: true });
 
-    const parts  = svc.start_command.trim().split(/\s+/);
-    const script = parts[0];
-    const args   = parts.slice(1).join(' ');
+    const INTERPRETERS = ['node', 'python', 'python3', 'bun', 'ts-node', 'deno', 'php', 'ruby', 'perl'];
+    const PKG_RUNNERS  = ['npm', 'yarn', 'pnpm'];
+    const parts = svc.start_command.trim().split(/\s+/);
+    let script, args, interpreter;
+
+    if (INTERPRETERS.includes(parts[0])) {
+      // e.g. "node index.js --port 3000"
+      interpreter = parts[0]; // "node"
+      script      = parts[1]; // "index.js"
+      args        = parts.slice(2).join(' ') || undefined;
+    } else if (PKG_RUNNERS.includes(parts[0])) {
+      // e.g. "npm run start" — pass whole thing as script with none interpreter
+      interpreter = 'none';
+      script      = parts[0]; // "npm"
+      args        = parts.slice(1).join(' ') || undefined; // "run start"
+    } else {
+      // e.g. "./start.sh"
+      script      = parts[0];
+      args        = parts.slice(1).join(' ') || undefined;
+      interpreter = 'none';
+    }
 
     // Per-service memory cap — use service override or global default
     const maxMB   = (svc.max_memory_mb && parseInt(svc.max_memory_mb, 10) > 0)
@@ -178,15 +196,16 @@ class Brain {
       name:   svc.id,
       script,
       args:   args || undefined,
+      interpreter,
       cwd:    dir,
       env:    { ...process.env, ...envVars, PORT: String(svc.port) },
       autorestart:               svc.auto_restart === 1,
-      max_restarts:              3,              // was 5
-      min_uptime:                '15s',          // was 10s
-      exp_backoff_restart_delay: 3000,           // was 500ms — prevents crash-loop RAM spike
-      max_memory_restart:        `${maxMB}M`,    // was missing entirely
+      max_restarts:              3,
+      min_uptime:                '15s',
+      exp_backoff_restart_delay: 3000,
+      max_memory_restart:        `${maxMB}M`,
       kill_timeout:              5000,
-      node_args:                 `--max-old-space-size=${heapMB}`, // was missing
+      node_args:                 interpreter === 'node' ? `--max-old-space-size=${heapMB}` : undefined,
       out_file:   `/var/log/firekid/${svc.id}.out.log`,
       error_file: `/var/log/firekid/${svc.id}.err.log`,
       merge_logs: true,
@@ -267,7 +286,7 @@ class Brain {
           type: 'brain', event: 'memory_hard', serviceId,
           message: `${info.name} hit ${mb}MB (limit ${maxMB}MB). Restarting.`,
         });
-        this._notify('crash', { name: info.name, message: `Memory hard limit hit: ${mb}MB / ${maxMB}MB. Service restarting.` }).catch(() => {});
+        this._notify('crash', { name: info.name, message: `Memory hard limit: ${mb}MB / ${maxMB}MB. Restarting.` }).catch?.(() => {});
 
         // Cancel any existing kill timer for this service
         const existing = this._killTimers.get(serviceId);
