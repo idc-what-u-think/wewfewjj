@@ -19,7 +19,7 @@ const si = require('systeminformation');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
-const { execSync, exec, spawn } = require('child_process');
+const { execSync, exec: shellExec, spawn } = require('child_process');
 // simple-git removed — cloneOrPullService now uses GitHub ZIP download via axios
 
 const app = express();
@@ -208,8 +208,8 @@ async function cloneOrPullService(service) {
       response.data.on('error', reject);
     });
   } catch (e) {
-    // Clean up partial zip
     fs.rmSync(tmpZip, { force: true });
+    console.error(`[deploy] Download failed for ${service.id}:`, e.message);
     const status = e.response?.status;
     if (status === 401 || status === 403) return { success: false, message: 'Unauthorised — check your PAT token has repo access.' };
     if (status === 404) return { success: false, message: `Repo not found: ${owner}/${repo} (branch: ${branch})` };
@@ -223,7 +223,7 @@ async function cloneOrPullService(service) {
     fs.mkdirSync(dir,    { recursive: true });
 
     await new Promise((resolve, reject) => {
-      exec(`unzip -o "${tmpZip}" -d "${tmpDir}"`, (err, _stdout, stderr) => {
+      shellExec(`unzip -o "${tmpZip}" -d "${tmpDir}"`, (err, _stdout, stderr) => {
         if (err) return reject(new Error(stderr || err.message));
         resolve();
       });
@@ -231,6 +231,7 @@ async function cloneOrPullService(service) {
   } catch (e) {
     fs.rmSync(tmpZip, { force: true });
     fs.rmSync(tmpDir, { recursive: true, force: true });
+    console.error(`[deploy] Extraction failed for ${service.id}:`, e.message);
     return { success: false, message: `Extraction failed: ${e.message}` };
   }
 
@@ -251,7 +252,7 @@ async function cloneOrPullService(service) {
 
     // Cross-device safe copy then delete source
     await new Promise((resolve, reject) => {
-      exec(`cp -r "${extractedPath}/." "${dir}"`, { env: process.env }, (err, _stdout, stderr) => {
+      shellExec(`cp -r "${extractedPath}/." "${dir}"`, { env: process.env }, (err, _stdout, stderr) => {
         if (err) return reject(new Error(stderr || err.message));
         resolve();
       });
@@ -259,6 +260,7 @@ async function cloneOrPullService(service) {
   } catch (e) {
     fs.rmSync(tmpZip, { force: true });
     fs.rmSync(tmpDir, { recursive: true, force: true });
+    console.error(`[deploy] Move failed for ${service.id}:`, e.message);
     return { success: false, message: `Move failed: ${e.message}` };
   }
 
