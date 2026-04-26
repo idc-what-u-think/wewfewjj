@@ -22,6 +22,7 @@ const fs = require('fs');
 const { execSync, exec: shellExec, spawn } = require('child_process');
 const crypto = require('crypto');
 const os = require('os');
+// simple-git removed — cloneOrPullService now uses GitHub ZIP download via axios
 
 const app = express();
 const server = http.createServer(app);
@@ -134,29 +135,66 @@ function pm2List() {
 }
 
 // ─────────────────────────────────────────────────────
+// IN-MEMORY D1 CACHE
+// Caches D1 reads for 15s — cuts Cloudflare Worker requests dramatically.
+// Write-through: any mutation invalidates the relevant cache entry.
+// ─────────────────────────────────────────────────────
+
+const _cache = {
+  services:  { data: null, ts: 0 },
+  tokens:    { data: null, ts: 0 },
+  settings:  { data: null, ts: 0 },
+};
+const CACHE_TTL = 15_000; // 15s
+
+function _cacheGet(key) {
+  const entry = _cache[key];
+  if (entry.data && (Date.now() - entry.ts) < CACHE_TTL) return entry.data;
+  return null;
+}
+function _cacheSet(key, data) {
+  _cache[key] = { data, ts: Date.now() };
+  return data;
+}
+function _cacheInvalidate(...keys) {
+  keys.forEach(k => { if (_cache[k]) _cache[k].ts = 0; });
+}
+
+// ─────────────────────────────────────────────────────
 // SERVICE HELPERS
 // ─────────────────────────────────────────────────────
 
 async function getServices() {
+  const cached = _cacheGet('services');
+  if (cached) return cached;
   try {
     const result = await d1.query('SELECT * FROM services ORDER BY created_at ASC');
-    return result.results || [];
+    return _cacheSet('services', result.results || []);
   } catch {
     return [];
   }
 }
 
 async function getService(id) {
+  // Try cache first
+  const cached = _cacheGet('services');
+  if (cached) {
+    const svc = cached.find(s => s.id === id);
+    if (svc) return svc;
+  }
   const result = await d1.query('SELECT * FROM services WHERE id = ?', [id]);
   return result.results?.[0] || null;
 }
 
 async function getTokens() {
+  const cached = _cacheGet('tokens');
+  if (cached) return cached;
   const result = await d1.query('SELECT id, name, account, note, created_at FROM github_tokens ORDER BY created_at ASC');
-  return result.results || [];
+  return _cacheSet('tokens', result.results || []);
 }
 
 async function getToken(name) {
+  // Tokens cache doesn't store the raw token — always hit D1 for security
   const result = await d1.query('SELECT token FROM github_tokens WHERE name = ?', [name]);
   return result.results?.[0]?.token || null;
 }
@@ -295,8 +333,6 @@ function getInstallCommand(language, dir) {
   }
 }
 
-// Runs a command via spawn and pipes stdout/stderr to an optional SSE sender.
-// Returns a promise that rejects on non-zero exit.
 function runCommand(cmd, args, cwd, send) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd, env: process.env });
@@ -314,12 +350,10 @@ async function installDeps(service, send) {
   const dir  = getServiceDir(service);
   const lang = service.language || detectLanguage(dir);
   const installCmd = getInstallCommand(lang, dir);
-
   if (installCmd) {
     const [cmd, args] = installCmd;
     await runCommand(cmd, args, dir, send);
   }
-
   if (service.build_command && service.build_command.trim()) {
     const parts = service.build_command.trim().split(/\s+/);
     await runCommand(parts[0], parts.slice(1), dir, send);
@@ -450,7 +484,7 @@ app.get('/api/services', requireAuth, async (req, res) => {
 
 app.post('/api/services', requireAuth, async (req, res) => {
   try {
-    const { name, repo_url, branch, pat_key, start_command, build_command, path_prefix, port, language, auto_restart, env_vars } = req.body;
+    const { name, repo_url, branch, pat_key, start_command, path_prefix, port, language, auto_restart, env_vars } = req.body;
 
     if (!name || !start_command || !path_prefix || !port) {
       return res.status(400).json({ error: 'name, start_command, path_prefix, port are required' });
@@ -461,12 +495,13 @@ app.post('/api/services', requireAuth, async (req, res) => {
     fs.mkdirSync(dir, { recursive: true });
 
     await d1.query(
-      `INSERT INTO services (id, name, repo_url, branch, pat_key, start_command, build_command, path_prefix, port, language, auto_restart, env_vars)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, name, repo_url || null, branch || 'main', pat_key || null, start_command, build_command || null, path_prefix, parseInt(port), language || 'node', auto_restart !== false ? 1 : 0, JSON.stringify(env_vars || {})]
+      `INSERT INTO services (id, name, repo_url, branch, pat_key, start_command, path_prefix, port, language, auto_restart, env_vars)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, name, repo_url || null, branch || 'main', pat_key || null, start_command, path_prefix, parseInt(port), language || 'node', auto_restart !== false ? 1 : 0, JSON.stringify(env_vars || {})]
     );
 
     await rebuildProxy();
+    _cacheInvalidate('services');
     res.json({ success: true, id });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -476,14 +511,15 @@ app.post('/api/services', requireAuth, async (req, res) => {
 app.put('/api/services/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, repo_url, branch, pat_key, start_command, build_command, path_prefix, port, language, auto_restart } = req.body;
+    const { name, repo_url, branch, pat_key, start_command, path_prefix, port, language, auto_restart } = req.body;
 
     await d1.query(
-      `UPDATE services SET name=?, repo_url=?, branch=?, pat_key=?, start_command=?, build_command=?, path_prefix=?, port=?, language=?, auto_restart=?, updated_at=datetime('now') WHERE id=?`,
-      [name, repo_url || null, branch || 'main', pat_key || null, start_command, build_command || null, path_prefix, parseInt(port), language || 'node', auto_restart !== false ? 1 : 0, id]
+      `UPDATE services SET name=?, repo_url=?, branch=?, pat_key=?, start_command=?, path_prefix=?, port=?, language=?, auto_restart=?, updated_at=datetime('now') WHERE id=?`,
+      [name, repo_url || null, branch || 'main', pat_key || null, start_command, path_prefix, parseInt(port), language || 'node', auto_restart !== false ? 1 : 0, id]
     );
 
     await rebuildProxy();
+    _cacheInvalidate('services');
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -502,6 +538,7 @@ app.delete('/api/services/:id', requireAuth, async (req, res) => {
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
 
     await rebuildProxy();
+    _cacheInvalidate('services');
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -551,16 +588,14 @@ app.post('/api/services/:id/deploy', requireAuth, async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection',    'keep-alive');
   res.flushHeaders();
-  req.socket.setTimeout(0); // prevent 2min idle timeout killing SSE
+  req.socket.setTimeout(0);
 
   let closed = false;
   req.on('close', () => { closed = true; });
 
   const send = (step, message, error = false) => {
     if (closed) return;
-    try {
-      res.write(`data: ${JSON.stringify({ step, message, error, ts: Date.now() })}\n\n`);
-    } catch {}
+    try { res.write(`data: ${JSON.stringify({ step, message, error, ts: Date.now() })}\n\n`); } catch {}
   };
 
   const end = (success, message) => {
@@ -601,14 +636,16 @@ app.post('/api/services/:id/deploy', requireAuth, async (req, res) => {
       `INSERT INTO deploy_log (service_id, status, message, triggered_by) VALUES (?, 'success', ?, 'manual')`,
       [svc.id, result.message]
     ).catch(() => {});
-    await sendNotification('deploy', { success: true, name: svc.name, message: `Deployed — ${fileCount} files` });
+
+    _cacheInvalidate('services');
+    sendNotification('deploy', { success: true, name: svc.name, message: `Deployed — ${fileCount} files` }).catch(() => {});
     end(true, `Deployed — ${fileCount} files in ${dir}`);
   } catch (e) {
     await d1.query(
       `INSERT INTO deploy_log (service_id, status, message, triggered_by) VALUES (?, 'failed', ?, 'manual')`,
       [req.params.id, e.message]
     ).catch(() => {});
-    await sendNotification('deploy', { success: false, name: req.params.id, message: e.message });
+    sendNotification('deploy', { success: false, name: req.params.id, message: e.message }).catch(() => {});
     end(false, e.message);
   }
 });
@@ -813,6 +850,7 @@ app.post('/api/tokens', requireAuth, async (req, res) => {
       'INSERT INTO github_tokens (id, name, token, account, note) VALUES (?, ?, ?, ?, ?)',
       [id, name, token, account || null, note || null]
     );
+    _cacheInvalidate('tokens');
     res.json({ success: true, id });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -822,6 +860,7 @@ app.post('/api/tokens', requireAuth, async (req, res) => {
 app.delete('/api/tokens/:id', requireAuth, async (req, res) => {
   try {
     await d1.query('DELETE FROM github_tokens WHERE id = ?', [req.params.id]);
+    _cacheInvalidate('tokens');
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -879,17 +918,11 @@ app.get('/api/brain/events', requireAuth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────
-// API — BRAIN METRICS (KV history)
+// API — BRAIN METRICS (in-memory, no KV)
 // ─────────────────────────────────────────────────────
 
-app.get('/api/brain/metrics', requireAuth, async (req, res) => {
-  try {
-    const raw = await kv.get('brain:metrics:history');
-    const history = raw ? JSON.parse(raw) : [];
-    res.json({ history });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+app.get('/api/brain/metrics', requireAuth, (req, res) => {
+  res.json({ history: brain.getMetricsHistory() });
 });
 
 // ─────────────────────────────────────────────────────
@@ -898,11 +931,14 @@ app.get('/api/brain/metrics', requireAuth, async (req, res) => {
 
 async function sendNotification(type, payload) {
   try {
-    const settings = await d1.query('SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?)', [
-      'notify_webhook', 'notify_on_deploy', 'notify_on_crash', 'server_label'
-    ]);
-    const s = {};
-    (settings.results || []).forEach(r => { s[r.key] = r.value; });
+    const cached = _cacheGet('settings');
+    let s = cached || {};
+    if (!cached) {
+      const result = await d1.query('SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?)', [
+        'notify_webhook', 'notify_on_deploy', 'notify_on_crash', 'server_label'
+      ]);
+      (result.results || []).forEach(r => { s[r.key] = r.value; });
+    }
     if (!s.notify_webhook) return;
     if (type === 'deploy' && s.notify_on_deploy === 'false') return;
     if (type === 'crash'  && s.notify_on_crash  === 'false') return;
@@ -989,8 +1025,6 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
     return;
   }
-  // express-session writes set-cookie via res.setHeader/writeHead/end.
-  // Passing {} causes TypeError if the session mutates. Use a safe stub.
   const fakeRes = {
     writeHead: () => {},
     setHeader: () => {},
@@ -1019,12 +1053,7 @@ wss.on('connection', (ws, req) => {
   let alive = true;
 
   const pingInterval = setInterval(() => {
-    if (!alive) {
-      // No pong received since last ping — connection is dead
-      ws.terminate();
-      clearInterval(pingInterval);
-      return;
-    }
+    if (!alive) { ws.terminate(); clearInterval(pingInterval); return; }
     alive = false;
     if (ws.readyState === WebSocket.OPEN) ws.ping();
   }, 20000);
