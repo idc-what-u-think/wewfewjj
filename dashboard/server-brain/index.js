@@ -115,7 +115,7 @@ class Brain {
     const validation = validateService(svc, SERVICES_DIR);
     if (!validation.ok) throw new Error(validation.reason);
 
-    // Skip port check if this service is already holding the port (already online)
+    // Skip port check if this service is already holding the port
     const procs = await pm2Bridge.list().catch(() => []);
     const existing = procs.find(p => p.name === svc.id);
     if (existing?.pm2_env?.status !== 'online') {
@@ -157,38 +157,34 @@ class Brain {
       : this._defaultMaxMB;
     const heapMB = Math.max(64, maxMB - 20);
 
-    // ── Correctly parse start_command into script + interpreter ──────────────
-    // PM2 rule (from docs):
-    //   - interpreter: the binary that runs the script (node, python3, etc.)
-    //   - script: the file passed to the interpreter
-    //   - For npm/yarn/pnpm: script='npm', args=['run','start'], interpreter='none'
-    //   - interpreter='none' means PM2 execs the script directly (needs shebang or be a binary)
+    // ── Correctly parse start_command into PM2 options ───────────────────────
+    // PM2 rule: interpreter = binary, script = file passed to it
+    // "node index.js"   → interpreter:'node',  script:'index.js'
+    // "npm run start"   → interpreter:'none',  script:'npm', args:['run','start']
+    // "./start.sh"      → interpreter:'none',  script:'./start.sh'
     const INTERPRETERS = ['node', 'python', 'python3', 'bun', 'ts-node', 'deno', 'php', 'ruby', 'perl'];
     const PKG_RUNNERS  = ['npm', 'yarn', 'pnpm'];
     const rawParts = svc.start_command.trim().split(/\s+/);
     let script, args, interpreter, nodeArgs;
 
     if (INTERPRETERS.includes(rawParts[0])) {
-      // e.g. "node index.js" → interpreter=node, script=index.js
       interpreter = rawParts[0];
       script      = rawParts[1];
       args        = rawParts.slice(2);
       nodeArgs    = interpreter === 'node' ? [`--max-old-space-size=${heapMB}`] : undefined;
     } else if (PKG_RUNNERS.includes(rawParts[0])) {
-      // e.g. "npm run start" → script=npm, args=["run","start"], interpreter=none
       interpreter = 'none';
       script      = rawParts[0];
       args        = rawParts.slice(1);
       nodeArgs    = undefined;
     } else {
-      // e.g. "./start.sh"
       interpreter = 'none';
       script      = rawParts[0];
       args        = rawParts.slice(1);
       nodeArgs    = undefined;
     }
 
-    // Delete any ghost entry before starting fresh
+    // Delete ghost entry before starting fresh
     await pm2Bridge.del(svc.id).catch(() => {});
 
     await pm2Bridge.start({
@@ -201,7 +197,7 @@ class Brain {
       env:         { ...process.env, ...envVars, PORT: String(svc.port) },
       autorestart:               svc.auto_restart === 1,
       max_restarts:              3,
-      min_uptime:                3000,  // ms — short enough to detect real crashes fast
+      min_uptime:                3000,
       exp_backoff_restart_delay: 3000,
       max_memory_restart:        `${maxMB}M`,
       kill_timeout:              5000,
@@ -210,8 +206,7 @@ class Brain {
       merge_logs: true,
     });
 
-    // pm2.start() resolves when daemon ACKs — NOT when process is actually online.
-    // Poll up to 8s for real status so we can catch one-launch-crash early.
+    // pm2.start() resolves on ACK not on online — poll up to 8s for real status
     let proc = null;
     for (let i = 0; i < 8; i++) {
       await new Promise(r => setTimeout(r, 1000));
@@ -419,6 +414,10 @@ class Brain {
       services,
       recentEvents: this._events.slice(-10),
     };
+  }
+
+  getMetricsHistory() {
+    return this._worker ? this._worker.getHistory() : [];
   }
 
   // ─── Broadcast to all connected WS clients ────────────────────────────────
